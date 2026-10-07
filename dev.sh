@@ -3,7 +3,9 @@
 #
 #   MCP_TOKEN=<token> bash dev.sh
 #
-# Watches blender.rmcp.rb, bindings/json.rb, blender_bridge.rs and mcp_extras.py.
+# Watches the DSL file, every binding, and the injected Rust - all of it,
+# because the compiler copies those in at build time and an edit that triggers
+# no build is invisible.
 # On a change it runs `rmcp_dsl check` first (fast, Ruby only, no cargo) and only
 # builds and restarts when the DSL itself accepts the file — so a typo never takes
 # the running server down; it keeps serving the last good build. Ctrl-C stops it.
@@ -17,7 +19,7 @@ BIN=./build/blender.rmcp/target/debug/blender
 PIDFILE=/tmp/mcp-server.pid
 BUILDLOG=/tmp/mcp-build.log
 SERVERLOG=/tmp/mcp-server.log
-WATCH=(blender.rmcp.rb bindings/json.rb blender_bridge.rs mcp_extras.py)
+WATCH=(blender.rmcp.rb bindings/*.rb *.rs)
 
 stamp() { cat "${WATCH[@]}" 2>/dev/null | shasum -a 256 | cut -c1-16; }
 stop() {
@@ -67,7 +69,7 @@ pick_python() {
   return 1
 }
 PYRUN="$(pick_python || true)"
-pystamp() { cat python/mcp_scripts.py mcp_extras.py 2>/dev/null | shasum -a 256 | cut -c1-16; }
+pystamp() { cat python/mcp_scripts.py 2>/dev/null | shasum -a 256 | cut -c1-16; }
 lint() {
   if [ -z "$PYRUN" ]; then
     echo "$(date +%T) lint    no uv and no python3 here, so the Python was not checked"
@@ -79,13 +81,34 @@ for path in sys.argv[1:]:
         ast.parse(open(path).read(), path)
     except SyntaxError as e:
         print("%s:%s: %s" % (path, e.lineno, e.msg))
-        sys.exit(1)' python/mcp_scripts.py mcp_extras.py >"$BUILDLOG" 2>&1; then
+        sys.exit(1)' python/mcp_scripts.py >"$BUILDLOG" 2>&1; then
     echo "$(date +%T) lint    the Python parses (via $PYRUN)"
   else
     echo "$(date +%T) LINT    the Python does not parse:"
     cat "$BUILDLOG"
     notify "Python lint failed: $(head -n 1 "$BUILDLOG")"
   fi
+}
+
+# A restart is not proof the new build works: a binary that panics on startup
+# looks exactly like one that is serving. Ask the port, using bash's own /dev/tcp
+# so this needs no curl and no nc.
+server_port() { grep -m1 'transport :http, port:' blender.rmcp.rb | grep -oE '[0-9]+' | head -1; }
+listening() {
+  local port; port=$(server_port)
+  [ -n "$port" ] || return 0
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null
+}
+wait_alive() {
+  local tries=0
+  while [ $tries -lt 10 ]; do
+    if listening; then return 0; fi
+    tries=$((tries + 1)); sleep 0.5
+  done
+  notify "MCP server did not come up after the rebuild: $(tail -n 3 "$SERVERLOG" | tr "\n" " ")"
+  echo "$(date +%T) START   the new build is not listening - the log says:"
+  tail -n 12 "$SERVERLOG"
+  return 1
 }
 
 lastpy=""
@@ -98,12 +121,13 @@ while true; do
   fi
   now=$(stamp)
   if [ "$now" != "$last" ]; then
-  if [ "$now" != "$last" ]; then
     last="$now"
     if rmcp_dsl check blender.rmcp.rb >"$BUILDLOG" 2>&1; then
       if rmcp_dsl build blender.rmcp.rb >>"$BUILDLOG" 2>&1; then
         stop; start
-        echo "$(date +%T) ok      rebuilt and restarted (pid $(cat "$PIDFILE"))"
+        if wait_alive; then
+          echo "$(date +%T) ok      rebuilt and restarted (pid $(cat "$PIDFILE"))"
+        fi
       else
         notify "MCP build failed: $(tail -n 5 "$BUILDLOG" | tr "\n" " ")"
         echo "$(date +%T) BUILD   failed — still serving the last good build:"

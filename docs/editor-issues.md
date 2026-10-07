@@ -4,6 +4,9 @@ Context: an agent in a container driving `raj ctl` over TCP against an editor on
 the user's machine, editing one DSL file and building it with a compiler that
 reads **disk**. Ordered by how much each one cost.
 
+Defects fixed since are condensed to a line of history where the lesson still
+has value. Numbers are the originals and do not shift — nothing has been dropped.
+
 ## 1. `save` can compose two writers' text into one malformed line
 
 The expensive one. A user edit (`has_names = !apply_to.nil?`) and an agent edit
@@ -59,24 +62,14 @@ disk == buffer once.
 buffer-vs-disk divergence in bytes so the two can be compared without shelling
 out.
 
-## 3. Stale generated-file buffers shadow reads, and `save --all` clobbers generated output
+## 3. Stale generated-file buffers shadowing reads, and `save --all` over generated output — fixed
 
 `build/**/src/main.rs` and `src/blender_bridge.rs` were left as headless buffers
-from earlier reads. After a later build rewrote them, the buffers kept the
-pre-build text and reported `unsaved-changes`, and `read`/`search` answered from
-the buffer. The agent read a look-tool body that no longer existed and nearly
-filed a codegen bug that wasn't there.
-
-`reload` and `close --discard` are both refused:
-`main.rs holds unsaved text written by the user; reload and close --discard may
-drop only the caller's own unsaved text` — even though the agent never wrote a
-byte of that file.
-
-Sharper half: a `save --all` in that workspace writes the stale buffers back
-over freshly generated sources.
-
-**Suggest:** don't keep generated paths as buffers (or reload them on change),
-and let a driver refresh text it never wrote.
+from earlier reads; a later build rewrote them on disk, and the buffers kept the
+pre-build text. The sharp half was that a `save --all` could write that stale
+text back over the freshly generated sources. That is guarded now: `save`
+refuses to overwrite a file that changed on disk unless `--force` is given, and
+`reload` takes the disk version. Reads answering from the buffer is by design.
 
 ## 4. LSP results are cached per referring document, and `ok` is not "it compiles"
 
@@ -104,24 +97,13 @@ checker reads disk; the create reply reads like the file exists.
 **Suggest:** say in the create reply that the path reaches disk only on save, or
 have disk-reading checks consult open buffers too.
 
-## 6. Rejected zero-width change sets deadlock `clear` and keep the workspace not-ready
+## 6. Rejected zero-width change sets deadlocking `clear` — fixed
 
-Two rejected sets — one 0 bytes, one 19 bytes, both `moved` — could not be
-disposed of:
-
-```
-clear: change set 47 cannot be cleared: change set 48 (author 19, bytes 0..0)
-overlaps it; reject or clear that set first
-```
-
-and 48 is blocked by the agent's own later set, whose purge would *reverse* a
-good edit. So `status` stays `dirty: 1 rejected sets (clear to dispose)` and
-`not ready: 3 of 14 buffer(s) dirty or pending` indefinitely, and the "clear to
-dispose" hint names an action that is refused.
-
-**Suggest:** let a zero-width set be cleared without a neighbour's consent (it
-carries no text), or offer a "drop every rejected/invalid set" that resolves the
-chain in one step.
+Two rejected sets, one zero-width, blocked each other
+(`cannot be cleared: change set 48 … overlaps it`) and left `status` not-ready
+indefinitely, naming a "clear to dispose" that was refused. `clear --all` now
+purges a buffer's rejected and invalid sets in one step, workspace-wide with
+`--everywhere` — the disposal this entry asked for.
 
 ## 7. The claim set is in-memory and resets on restart
 
@@ -151,19 +133,12 @@ agent briefly mis-read which sets were pending.
 **Suggest:** document the columns in `--help`, or make the plain form
 whitespace-safe; `--json` is the reliable interface.
 
-## 10. `exec` over TCP plus an unmounted sandbox leaves the agent unable to verify anything
+## 10. `exec` over TCP with an unmounted sandbox — documented
 
-`exec` is refused over TCP by design ("the command would run on the editor's
-machine, outside your sandbox — run it with your own shell instead"), and the
-skill's answer is that the sandbox has the workspace mounted. Here the sandbox
-had no mount (an empty working directory) and no toolchain, so every build, test
-and diff was a user round trip — about a dozen of them in one session.
-
-**Suggest:** state plainly, in the container section, that without the
-`-v "$PWD:/workspace"` mount the agent can write code but can never build it, so
-every verification is the user's; that is a property of the setup, and knowing it
-up front would have shaped the whole session (the user offered exactly this
-mid-way, as "hooks").
+The container section no longer claims the workspace is mounted: it states there
+is no shared filesystem, that `exec` is refused over TCP by design, and it puts
+the `-v "$PWD:/workspace"` mount in the run setup, so the cost is visible before
+a session shapes around it.
 
 ## 11. Two writers on one file, and a copy that truncates first, cost the file
 
@@ -271,7 +246,6 @@ landed in one pass. That works only when the agent kept a copy — nothing in th
 editor offered one, and the change-set records from before the restart were gone
 with the buffers.
 
-
 ## 15. LSP diagnostics can stay stale, and a question that was never answered looks like silence
 
 Twice in one session the reading mattered and both times it was wrong in the same
@@ -289,3 +263,37 @@ second file, "the text it saw" can include that file as of before the save.
 publish's age, so a caller can tell "clean" from "never asked". Failing that, make
 `stale` an error rather than a status, since a driver that treats it as a reading is
 the failure mode this entry is about.
+
+## From the October session: three things that each cost a call
+
+**An absolute workspace path is refused when the shell is elsewhere.** Running
+`raj ctl read --as claude --json /work/smoke.sh | jq -r .text > /tmp/smoke/smoke.sh`
+from `/tmp/smoke` answered `raj ctl: path is outside the workspace: /work/smoke.sh
+is not under /tmp/smoke`. The path is absolute and inside the root map; only the
+working directory was outside the mapped root, and that was enough to reinterpret
+it against the cwd. The same read from `/work` worked unchanged. This is issue 12
+seen from the other side, and it fails quietly: the redirect created `smoke.sh`
+with nothing in it, `bash -n` said it parsed, and the suite reported no results
+rather than an error.
+
+**A literal search is refused when the pattern contains regex metacharacters.**
+Looking for `let mut lit = [0.0f64; 3];` answered `search: no matches; "let mut
+lit = [0.0f64; 3];" contains regex metacharacters — retry with --regex`. Search is
+literal by default, so a literal `[` is not a regex and `--regex` would mean
+something different. The message also leads with "no matches", so a caller that
+pipes the result into `jq` gets `null` and a blank line: a structural check of mine
+read as "zero occurrences" when it had not run at all.
+
+**A workspace script cannot be run where the agent is.** `exec` is refused over TCP
+by design and the sandbox shares no filesystem, so exercising `smoke.sh` meant
+`raj ctl read --json <path> | jq -r .text > /tmp/copy` and running the copy. That is
+workable, but every dependency has to be carried across by hand: `mcp.sh` needed a
+shim that execs a node client of the same verbs, because the image has no curl. The
+missing verb is the obvious one — say "materialise this file where I can run it" —
+and until then the redirect above is that verb, done manually.
+
+Still missing, and it cost a call on its own: **no way to ask whether a buffer is
+backed by a file**. `buffers` reports `unsaved-changes` for a buffer whose file has
+never been written, which is what `blender-tools/SKILL.md` was — a tab with 69 lines
+and no file behind it. Issue 2's undefined `read --disk` is the verb that would
+answer it.

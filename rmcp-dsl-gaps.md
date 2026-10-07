@@ -387,3 +387,234 @@ the call fails where a fallback should have moved on. Python gets this with
 **Suggest:** document "failures are values, not exceptions" as *the* retry
 pattern (it is easy to reach for `rescue` first), or allow a `rescue`-like form.
 
+## Evidence for the fix pass (2026-10-07, after the first live run)
+
+Gathered on request: three new items, a verified repro for item 20, and the
+positives worth not breaking.
+
+### Verified repro for item 20, both directions
+
+One `initialize` request against a running server, changing only the `Host`
+header (20 lines of node; `http.request` with the header set by hand, since
+`fetch` refuses to set `Host` at all):
+
+```
+Host: host.docker.internal:8787   ->  403  Forbidden: Host header is not allowed
+Host: 127.0.0.1:8787              ->  200  data: {"jsonrpc":"2.0","id":1,"result":{..."name":"blender"...}}
+Host: localhost:8787              ->  200  (same)
+```
+
+The accepted set is exactly the loopback *names*: the port is ignored, and the
+authority a container must dial is refused even though it resolves to the same
+server. Two one-keyword surfaces would close it, and the first matches the
+intent, since this transport exists so that a caller **not** on loopback can
+reach it:
+
+```ruby
+transport :http, port: 8787, auth_setting: :mcp_token,
+          allowed_hosts: ["host.docker.internal", "*.internal"]
+          # or bind: "0.0.0.0", which widens exposure
+```
+
+### 24. `runtime` — one transport per server, so stdio and HTTP cannot coexist
+
+A file may declare exactly one `transport`. This build started as stdio and
+became HTTP because the caller that mattered was not on the same machine; the
+other shape then needs a shim that speaks its transport and forwards, which is a
+second implementation of a protocol this project already implemented once.
+
+**Suggest:** accept a list (`transport :stdio, :http`) or a second declaration.
+Failing that, a generated stdio<->http bridge is a smaller thing to hand a user
+than "write a proxy", and it is the same machinery the HTTP transport already
+has.
+
+### 25. `ergonomics` — the required-list diagnostic does not say "required"
+
+```ruby
+field :names, :string_list, description: "..."   # required
+listed = Json.str_list_json(names || [])         # the idiom for an optional field
+```
+
+answers `an array literal needs at least one element`. The literal is only a
+problem because `names` is already a `Vec<String>` rather than an `Option` — and
+that is the actual information. Both spellings are correct in this codebase, on
+adjacent lines, depending on the field.
+
+**Suggest:** when the left operand of `||` is not nilable, say it: "`names` is
+not nilable, so `||` gives `[]` no element type; drop the fallback".
+
+### 26. `ergonomics` — a body-shape error names the statement, not the cause
+
+An edit inserted a `params ... do ... end` block one line early, so it landed
+inside an existing tool body and the body's own `end`s then closed the new tool:
+
+```
+unsupported CallNode as a statement (only `name = expr`, a guard clause, ... before the last expression)
+```
+
+True and precise about what is allowed, but it points inside the wrong place.
+The cause was an earlier unbalanced `end`, one tool above.
+
+**Suggest:** when a body contains a construct that only belongs at the top
+level, add "and the enclosing `tool :x` body, opened at line N, is still open".
+
+### Confirmed working, added to the earlier list
+
+- **A missing `output:` is caught at check time**, naming the statement, the
+  type and the fix: `body must return a string, got TextReport; use .to_s, or
+  end it in a content block such as text(...) or image(...)`. Five tools missing
+  it were found before any build.
+- **rustc errors are mapped back to the Ruby line and helper**:
+  `blender.rmcp.rb:245: error: use of moved value ... (in helper `gen_poll`;
+  generated src/main.rs:840)`. That mapping is what turned a move error into a
+  two-line fix instead of archaeology into generated code.
+- **`check` is separate from `build`** and fast enough to run on every change;
+  a watcher that keeps the old server alive when `check` fails turned three
+  would-be outages tonight into log lines.
+- **Checked arithmetic carries a source tag**, so a generated panic names the
+  DSL line and helper rather than the emitted expression.
+
+
+### 27. `tooling` — a binding that is never loaded fails as a missing crate, two steps later
+
+`bindings/imagefile.rb` declared `crate "image", "0.25"`; nothing called it, and no
+`use_bindings :imagefile` was added. The file was therefore never parsed, its crate
+never reached `Cargo.toml`, and the failure surfaced two steps away: a `rust_file`
+written to use `image::open` failed to compile with `cannot find module or crate
+'image'` — an error about generated code, aimed at the injected file rather than at
+the one-line omission in the DSL.
+
+The LSP said `ok` throughout, which is the part worth fixing. At load time the
+compiler knows which `bindings/*.rb` exist on disk and which ones a `use_bindings`
+brought in, so an unloaded binding is detectable without compiling anything.
+
+**Note, later the same session:** the *other* half of this check already exists and
+is excellent. Once the binding was loaded, the compiler refused it precisely —
+`use_bindings :imagefile is declared but no body calls ImageFile.<method>; remove
+it or call it` — so "loaded but unused" is a check-time error with a clear remedy.
+It is only the file that no `use_bindings` names that stays silent, and that is the
+case this entry asks about; "declared but never loaded" and "loaded but never
+called" are two different failures and only the second is caught today.
+
+**Suggest:** when a DSL file sits beside a `bindings/` folder containing a `.rb`
+that no `use_bindings` names, warn: "bindings/imagefile.rb exists and is not loaded;
+its crates are not declared". That is the same class of catch the `output:` omission
+already gets, and it would have turned a rustc archaeology session into a line at
+`check` time.
+$ cd ~/Desktop/projects/mcp_true_test && \
+> MCP_TOKEN=9953b8392fa40abdb6fbb05d16c011db RAJ_NOTIFY=raj-0b6990fc bash dev.sh
+21:24:33 lint    the Python parses (via uv run --quiet --no-project python)
+21:25:45 BUILD   failed — still serving the last good build:
+blender.rmcp.rb:408: warning: unnecessary parentheses around function argument (in helper `gen_wait`; generated src/main.rs:1504)
+warning: unnecessary parentheses around function argument
+    --> src/main.rs:1504:125
+     |
+1504 | ... mut __st = ck_add_i64((kind.chars().count() as i64), 1, "blender.rmcp.rb:41...
+     |                           ^                           ^
+     |
+help: remove these parentheses
+     |
+1504 -         let ident = ({ let __cs: Vec<char> = rest.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64((kind.chars().count() as i64), 1, "blender.rmcp.rb:412:18 in helper `gen_wait`")? as i64; let __ln = (rest.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
+1504 +         let ident = ({ let __cs: Vec<char> = rest.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64(kind.chars().count() as i64, 1, "blender.rmcp.rb:412:18 in helper `gen_wait`")? as i64; let __ln = (rest.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
+     |
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `blender` (bin "blender") due to 1 previous error; 3 warnings emittedLast login: Tue Oct  6 19:20:12 on ttys005
+exec bash -l && clear
+rajandavis@MacBookPro mcp_true_test % exec bash -l && clear
+
+The default interactive shell is now zsh.
+To update your account to use zsh, please run `chsh -s /bin/zsh`.
+For more details, please visit https://support.apple.com/kb/HT208050.
+rajandavis ~/Desktop/projects/mcp_true_test on main[!?]
+$ cargo test --manifest-path build/blender.rmcp/Cargo.toml,
+error: manifest path `build/blender.rmcp/Cargo.toml,` does not exist
+rajandavis ~/Desktop/projects/mcp_true_test on main[!?]
+$ cargo test --manifest-path build/blender.rmcp/Cargo.toml
+    Blocking waiting for file lock on build directory
+   Compiling blender v0.1.0 (/Users/rajandavis/Desktop/projects/mcp_true_test/build/blender.rmcp)
+error[E0425]: cannot find function `image_numbers` in module `textvision`
+    --> src/main.rs:1724:34
+     |
+1724 |         let report = textvision::image_numbers(&source);
+     |                                  ^^^^^^^^^^^^^ not found in `textvision`
+
+warning: unnecessary parentheses around function argument
+    --> src/main.rs:1444:584
+     |
+1444 | ... let __ln = ck_sub_i64((word.chars().count() as i64), 1, "blender.rmcp.rb:15...
+     |                           ^                           ^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+1444 -     Ok(if word == "" { "Generated".to_string() } else { let initial = ({ let __cs: Vec<char> = word.chars().collect(); let __n = __cs.len() as i64; let mut __st = 0 as i64; let __ln = 1 as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string()).to_uppercase(); let tail = ({ let __cs: Vec<char> = word.chars().collect(); let __n = __cs.len() as i64; let mut __st = 1 as i64; let __ln = ck_sub_i64((word.chars().count() as i64), 1, "blender.rmcp.rb:159:22 in helper `gen_default_name`")? as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string()); format!("{}{}", initial, tail) })
+1444 +     Ok(if word == "" { "Generated".to_string() } else { let initial = ({ let __cs: Vec<char> = word.chars().collect(); let __n = __cs.len() as i64; let mut __st = 0 as i64; let __ln = 1 as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string()).to_uppercase(); let tail = ({ let __cs: Vec<char> = word.chars().collect(); let __n = __cs.len() as i64; let mut __st = 1 as i64; let __ln = ck_sub_i64(word.chars().count() as i64, 1, "blender.rmcp.rb:159:22 in helper `gen_default_name`")? as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string()); format!("{}{}", initial, tail) })
+     |
+
+warning: unnecessary parentheses around function argument
+    --> src/main.rs:1502:126
+     |
+1502 | ...ut __st = ck_add_i64((provider.chars().count() as i64), 1, "blender.rmcp.rb:...
+     |                         ^                               ^
+     |
+help: remove these parentheses
+     |
+1502 -         let rest = ({ let __cs: Vec<char> = handle.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64((provider.chars().count() as i64), 1, "blender.rmcp.rb:410:19 in helper `gen_wait`")? as i64; let __ln = (handle.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
+1502 +         let rest = ({ let __cs: Vec<char> = handle.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64(provider.chars().count() as i64, 1, "blender.rmcp.rb:410:19 in helper `gen_wait`")? as i64; let __ln = (handle.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
+     |
+
+warning: unnecessary parentheses around function argument
+    --> src/main.rs:1504:125
+     |
+1504 | ... mut __st = ck_add_i64((kind.chars().count() as i64), 1, "blender.rmcp.rb:41...
+     |                           ^                           ^
+     |
+help: remove these parentheses
+     |
+1504 -         let ident = ({ let __cs: Vec<char> = rest.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64((kind.chars().count() as i64), 1, "blender.rmcp.rb:412:18 in helper `gen_wait`")? as i64; let __ln = (rest.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
+1504 +         let ident = ({ let __cs: Vec<char> = rest.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64(kind.chars().count() as i64, 1, "blender.rmcp.rb:412:18 in helper `gen_wait`")? as i64; let __ln = (rest.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
+     |
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `blender` (bin "blender" test) generated 3 warnings
+error: could not compile `blender` (bin "blender" test) due to 1 previous error; 3 warnings emitted
+rajandavis ~/Desktop/projects/mcp_true_test on main[!?]
+$
+### 28. `tooling` — the `rust_fn` name *is* the Rust function's name, and no reference says so
+
+```ruby
+rust_fn :image_numbers, args: [:string], returns: :string, from: :textvision
+```
+
+emits `textvision::image_numbers(...)`, so the module has to define exactly that
+name. The module defines `numbers`, the build answered `cannot find function
+'image_numbers' in module 'textvision'`, and the fix was to rename the declaration
+rather than anything in the Rust.
+
+Worth filing only because the rule is unstated: the references document
+`rust(:name, args)` as the *call* form, and the declaration's `from:` as the module,
+but never that the declared name is the function to look for inside it. Four words
+on the declaration would do it — "the name is the function's name" — and the error
+message already says as much, which is why this cost one rename and no archaeology.
+
+**Suggest:** state the mapping where `rust_fn` is declared.
+
+### 29. `tooling` — the compiler knows its inputs and does not say what they are
+
+A watcher has to know which files a build reads. Ours was hand-written —
+`blender.rmcp.rb`, `bindings/json.rb`, `blender_bridge.rs` — and wrong twice in one
+day: `blender_gen.rs` from the first session, then the new `textvision.rs`. The
+failure mode is silent in the worst way. Editing injected Rust changes nothing, no
+build runs, and a `cargo test` against the stale copy reports the *old* assertions
+failing with the *old* messages; `Finished in 0.36s` was the only clue that nothing
+had recompiled.
+
+The compiler is the only component that knows the complete set: it reads the DSL
+file, every `use_bindings` file and every `rust_file`, resolves them (including the
+`../` fallbacks), and hashes their text for codegen anyway.
+
+**Suggest:** print the input paths on a successful build, one per line, or add
+`--print-inputs`. A watcher built from that list is correct by construction; one
+maintained by hand was wrong twice in a day, and both times the symptom pointed at
+the tests rather than at the missing build.

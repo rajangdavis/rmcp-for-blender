@@ -8,6 +8,7 @@ __pycache__/
 
 # macOS
 .DS_Store
+rmcp_dsl
 
 # third-party tree: only the file the server reads at runtime, plus the addon
 # whose command names and kwargs our tools encode

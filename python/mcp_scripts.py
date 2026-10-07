@@ -11,6 +11,38 @@ One entry point by hand, with no server and no bridge:
     blender --background --python python/mcp_scripts.py -- reveal '{"name": "Chair"}'
 """
 
+def push_step(message):
+    """Mark an undo boundary, so the user's own undo lands on this call rather
+    than in the middle of it. There is deliberately no undo tool: a single-step
+    test of one ended the session, so the boundary is left for the user.
+
+    Blender's undo is the whole file's history, not one tool's; without a
+    boundary a later undo walks back through whatever happened before it.
+    """
+    import bpy
+
+    try:
+        bpy.ops.ed.undo_push(message=message)
+    except Exception:
+        pass
+
+
+def undoable(fn):
+    """Wrap an entry point so it opens an undo step before it changes anything."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(args):
+        subject = args.get("name") or args.get("names") or args.get("target") or args.get("file") or ""
+        if isinstance(subject, (list, tuple)):
+            subject = ", ".join(str(s) for s in subject[:3])
+        push_step("%s: %s" % (fn.__name__, subject) if str(subject) != "" else fn.__name__)
+        return fn(args)
+
+    return wrapped
+
+
+@undoable
 def reveal(args):
     import bpy
 
@@ -155,6 +187,7 @@ def reveal(args):
         lines.append("note: %s is not in view layer %s, so no viewport can draw it; the collections above say where it lives" % (ob.name, view_layer.name))
     return {"report": "\n".join(lines)}
 
+@undoable
 def text(args):
     import bpy
 
@@ -225,6 +258,7 @@ def text(args):
     lines.append("%d objects in the scene now" % len(bpy.data.objects))
     return {"report": "\n".join(lines)}
 
+@undoable
 def place(args):
     import bpy, math
 
@@ -311,6 +345,7 @@ def place(args):
         lines.append("changed: nothing - pass at least one of x, y, z, rx, ry, rz, scale")
     return {"report": "\n".join(lines)}
 
+@undoable
 def material(args):
     import bpy
 
@@ -453,6 +488,7 @@ def material(args):
     lines.append("materials on %s now: %s" % (ob.name, ", ".join("%d: %s" % (i, m.name if m else "(empty)") for i, m in enumerate(data.materials))))
     return {"report": "\n".join(lines)}
 
+@undoable
 def render(args):
     import bpy, os, time
 
@@ -543,6 +579,7 @@ def render(args):
              "read it back as text with image_report(source=\"%s\")" % path]
     return {"path": path, "report": "\n".join(lines)}
 
+@undoable
 def export(args):
     import bpy, os
 
@@ -645,6 +682,7 @@ def export(args):
     return {"path": path, "report": "\n".join(lines)}
 
 
+@undoable
 def remove(args):
     """Delete objects, and say what that cost: what went, what the children did,
     what the orphan purge freed, and what is left."""
@@ -710,12 +748,737 @@ def remove(args):
     return {"report": "\n".join(lines)}
 
 
+def look_at_rotation(location, point):
+    """A camera-style rotation (looking along -Z, +Y up) from a position to a point."""
+    from mathutils import Vector
+
+    direction = Vector(point) - Vector(location)
+    if direction.length < 1e-6:
+        return (0.0, 0.0, 0.0)
+    return tuple(direction.to_track_quat("-Z", "Y").to_euler())
+
+
+def bounds_of(objects):
+    """The world-space centre and the largest dimension across these objects."""
+    from mathutils import Vector
+
+    lo = None
+    hi = None
+    for ob in objects:
+        for corner in ob.bound_box:
+            point = ob.matrix_world @ Vector(corner)
+            if lo is None:
+                lo = Vector((point.x, point.y, point.z))
+                hi = Vector((point.x, point.y, point.z))
+            else:
+                lo = Vector((min(lo.x, point.x), min(lo.y, point.y), min(lo.z, point.z)))
+                hi = Vector((max(hi.x, point.x), max(hi.y, point.y), max(hi.z, point.z)))
+    if lo is None:
+        return (Vector((0.0, 0.0, 0.0)), 1.0)
+    centre = (lo + hi) / 2.0
+    size = max(hi.x - lo.x, hi.y - lo.y, hi.z - lo.z)
+    return (centre, size if size > 1e-6 else 1.0)
+
+
+def view_direction(view, distance):
+    """Where to stand, relative to a centre, for a named view."""
+    from mathutils import Vector
+
+    if view == "front":
+        return Vector((0.0, -distance, 0.0))
+    if view == "back":
+        return Vector((0.0, distance, 0.0))
+    if view == "left":
+        return Vector((-distance, 0.0, 0.0))
+    if view == "right":
+        return Vector((distance, 0.0, 0.0))
+    if view == "top":
+        return Vector((0.0, 0.0, distance))
+    return Vector((distance * 0.55, -distance * 0.7, distance * 0.45))
+
+
+@undoable
+def duplicate(args):
+    """Copy objects, offsetting each copy, so one generated chair can become a row."""
+    import bpy
+
+    names = args.get("names") or []
+    if not isinstance(names, (list, tuple)):
+        names = [names]
+    wanted = [str(n).strip() for n in names if str(n).strip() != ""]
+    if len(wanted) == 0:
+        return {"report": "duplicate needs at least one object name; scene lists what is here"}
+    count = int(args.get("count") or 1)
+    count = max(1, min(count, 200))
+    linked = args.get("linked")
+    if linked is None:
+        linked = False
+    step = [float(args.get("dx") or 0.0), float(args.get("dy") or 0.0), float(args.get("dz") or 0.0)]
+
+    made = []
+    missing = []
+    for name in wanted:
+        ob = bpy.data.objects.get(name)
+        if ob is None:
+            missing.append(name)
+            continue
+        for i in range(1, count + 1):
+            copy = ob.copy()
+            if not linked and ob.data is not None:
+                copy.data = ob.data.copy()
+            copy.location = (ob.location.x + step[0] * i,
+                             ob.location.y + step[1] * i,
+                             ob.location.z + step[2] * i)
+            if ob.parent is not None:
+                copy.parent = ob.parent
+            pasted = False
+            for collection in ob.users_collection:
+                collection.objects.link(copy)
+                pasted = True
+            if not pasted:
+                bpy.context.scene.collection.objects.link(copy)
+            made.append(copy.name)
+
+    if len(made) == 0:
+        lines = ["no object named %s" % ", ".join(missing)]
+        for name in missing:
+            near = [o.name for o in bpy.data.objects if name.lower() in o.name.lower()][:5]
+            if len(near) > 0:
+                lines.append("  nearest to %r: %s" % (name, ", ".join(near)))
+        lines.append("nothing was copied; %d object(s) here" % len(bpy.data.objects))
+        return {"report": "\n".join(lines)}
+
+    lines = ["copied %d object(s): %s" % (len(made), ", ".join(made))]
+    if len(missing) > 0:
+        lines.append("no object named %s" % ", ".join(missing))
+    lines.append("step (%g, %g, %g) per copy, from the original's own position" % tuple(step))
+    if linked:
+        lines.append("linked: every copy shares the original's mesh data, so editing one changes them all")
+    else:
+        lines.append("full copies: each has its own mesh, so one can be edited without the others")
+    lines.append("%d object(s) in the scene now" % len(bpy.data.objects))
+    return {"report": "\n".join(lines)}
+
+
+@undoable
+def array(args):
+    """Stack copies of one object with the array modifier, which follows the original."""
+    import bpy
+
+    name = (args.get("name") or "").strip()
+    ob = bpy.data.objects.get(name)
+    if ob is None:
+        return {"report": "array needs the exact name of a mesh object; scene lists them"}
+    if ob.type != "MESH":
+        return {"report": "%s is a %s object; the array modifier needs a mesh" % (ob.name, ob.type)}
+    count = max(1, min(int(args.get("count") or 3), 1000))
+    mode = (args.get("mode") or "constant").lower()
+    if mode not in ("constant", "relative"):
+        return {"report": "mode must be constant (offset in metres) or relative (as a factor of the object), not %r" % mode}
+    offsets = [args.get("offset_x"), args.get("offset_y"), args.get("offset_z")]
+    given = [float(v) for v in offsets if v is not None]
+    if len(given) == 0:
+        if mode == "relative":
+            offsets = [1.0, 0.0, 0.0]
+        else:
+            offsets = [ob.dimensions.x, 0.0, 0.0]
+    else:
+        offsets = [0.0 if v is None else float(v) for v in offsets]
+
+    modifier = None
+    for existing in ob.modifiers:
+        if existing.type == "ARRAY":
+            modifier = existing
+            break
+    fresh = modifier is None
+    if fresh:
+        modifier = ob.modifiers.new("Array", "ARRAY")
+    modifier.count = count
+    modifier.use_relative_offset = (mode == "relative")
+    modifier.use_constant_offset = (mode == "constant")
+    modifier.relative_offset_displace = (offsets[0], offsets[1], offsets[2])
+    modifier.constant_offset_displace = (offsets[0], offsets[1], offsets[2])
+    bpy.context.view_layer.update()
+
+    base_faces = len(ob.data.polygons)
+    shown = base_faces
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        shown = len(ob.evaluated_get(depsgraph).data.polygons)
+    except Exception:
+        pass
+
+    lines = ["%s: array modifier %s, count %d, offsets (%g, %g, %g) %s"
+             % (ob.name, "created" if fresh else "updated", count, offsets[0], offsets[1], offsets[2],
+                "as factors of the object" if mode == "relative" else "in metres")]
+    lines.append("faces %d in the mesh, %d with the modifier applied" % (base_faces, shown))
+    lines.append("the modifier follows the object: move the original and the whole row moves; renders and exports apply it")
+    lines.append("mesh_report and wireframe read the base mesh, so they still show %d faces" % base_faces)
+    if count == 1:
+        lines.append("count 1 is one copy: nothing is added")
+    return {"report": "\n".join(lines)}
+
+
+@undoable
+def boolean(args):
+    """Cut, join or intersect two meshes, and report what the result actually is."""
+    import bpy
+
+    name = (args.get("name") or "").strip()
+    operand_name = (args.get("operand") or "").strip()
+    ob = bpy.data.objects.get(name)
+    operand = bpy.data.objects.get(operand_name)
+    if ob is None:
+        return {"report": "boolean needs the exact name of the object to modify; scene lists them"}
+    if operand is None:
+        return {"report": "boolean needs the exact name of the object to cut with, as operand"}
+    if ob == operand:
+        return {"report": "the operand is the same object as %s; it takes a second object" % ob.name}
+    if ob.type != "MESH" or operand.type != "MESH":
+        return {"report": "both objects must be meshes; %s is a %s and %s is a %s" % (ob.name, ob.type, operand.name, operand.type)}
+    operation = (args.get("operation") or "difference").lower()
+    if operation not in ("difference", "union", "intersect"):
+        return {"report": "operation must be difference, union or intersect, not %r" % operation}
+    apply_now = args.get("apply")
+    if apply_now is None:
+        apply_now = True
+    hide = args.get("hide_operand")
+    if hide is None:
+        hide = True
+
+    before = len(ob.data.polygons)
+    modifier = ob.modifiers.new("Boolean", "BOOLEAN")
+    modifier.operation = operation.upper()
+    modifier.object = operand
+    bpy.context.view_layer.update()
+
+    applied = False
+    note = ""
+    if apply_now:
+        for o in list(bpy.context.selected_objects):
+            o.select_set(False)
+        bpy.context.view_layer.objects.active = ob
+        ob.select_set(True)
+        try:
+            bpy.ops.object.modifier_apply(modifier=modifier.name)
+            applied = True
+        except Exception as e:
+            note = "could not apply the modifier (%s), so it stays live" % e
+    after = len(ob.data.polygons)
+    if not applied:
+        try:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            after = len(ob.evaluated_get(depsgraph).data.polygons)
+        except Exception:
+            after = before
+    if hide:
+        operand.hide_viewport = True
+        operand.hide_render = True
+
+    lines = ["%s %s %s: faces %d -> %d" % (ob.name, operation, operand.name, before, after)]
+    lines.append("modifier %s" % ("applied, so the mesh itself changed" if applied else "left live, so the result is evaluated on top"))
+    if note != "":
+        lines.append(note)
+    if hide:
+        lines.append("%s is now hidden in the viewport and from renders, as a cutter usually is" % operand.name)
+    if after == 0:
+        lines.append("the result is empty: check that the two objects overlap")
+    elif after == before:
+        lines.append("the face count did not change: the objects may not overlap, or the cut missed")
+    return {"report": "\n".join(lines)}
+
+
+@undoable
+def aim(args):
+    """Put the camera where it frames a target, so a render or a look shows the subject."""
+    import bpy, math
+
+    name = (args.get("target") or "").strip()
+    ob = bpy.data.objects.get(name)
+    if ob is None:
+        return {"report": "aim needs the exact name of an object to look at; scene lists them"}
+    camera_name = (args.get("camera") or "").strip()
+    camera = bpy.data.objects.get(camera_name) if camera_name != "" else bpy.context.scene.camera
+    created = False
+    if camera is None:
+        data = bpy.data.cameras.new(camera_name or "MCP Camera")
+        camera = bpy.data.objects.new(camera_name or "MCP Camera", data)
+        bpy.context.scene.collection.objects.link(camera)
+        created = True
+    if camera.type != "CAMERA":
+        return {"report": "%s is a %s object, not a camera" % (camera.name, camera.type)}
+    view = (args.get("view") or "three_quarter").lower()
+    lens = args.get("lens")
+    if lens is not None:
+        camera.data.lens = float(lens)
+    lens = camera.data.lens
+    centre, size = bounds_of([ob])
+    want = args.get("distance")
+    if want is None:
+        sensor = camera.data.sensor_width or 36.0
+        half_angle = math.atan((sensor / 2.0) / max(lens, 1e-3))
+        want = (size / 2.0) / math.tan(half_angle) * 1.8
+    want = float(want)
+    location = centre + view_direction(view, want)
+    camera.location = location
+    camera.rotation_mode = "XYZ"
+    camera.rotation_euler = look_at_rotation(location, centre)
+    bpy.context.scene.camera = camera
+    bpy.context.view_layer.update()
+
+    lines = ["camera %s%s set to %s of %s" % (camera.name, " (created)" if created else "", view, ob.name)]
+    lines.append("target centre (%g, %g, %g), largest dimension %g m; camera %g m away at (%g, %g, %g), lens %g mm"
+                 % (centre.x, centre.y, centre.z, size, want, location.x, location.y, location.z, lens))
+    lines.append("it is now the scene camera, so render and look(mode=\"camera\") frame %s" % ob.name)
+    if size < 0.02:
+        lines.append("%s is less than 2 cm across; move closer or set distance explicitly" % ob.name)
+    return {"report": "\n".join(lines)}
+
+
+@undoable
+def light(args):
+    """Make or adjust a light, aimed at something useful rather than at nothing."""
+    import bpy
+
+    name = (args.get("name") or "").strip()
+    ob = bpy.data.objects.get(name) if name != "" else None
+    if name != "" and ob is None:
+        near = [o.name for o in bpy.data.objects if name.lower() in o.name.lower()][:5]
+        return {"report": "no object named %r%s; leave name unset to create a light" % (name, ("; nearest: " + ", ".join(near)) if len(near) > 0 else "")}
+    kind = (args.get("kind") or "sun").lower()
+    if kind not in ("point", "sun", "area", "spot"):
+        return {"report": "type must be point, sun, area or spot, not %r" % kind}
+    created = False
+    if ob is None:
+        data = bpy.data.lights.new(name or "MCP Light", type=kind.upper())
+        ob = bpy.data.objects.new(name or "MCP Light", data)
+        collection = bpy.context.scene.collection
+        try:
+            if bpy.context.collection is not None:
+                collection = bpy.context.collection
+        except Exception:
+            pass
+        collection.objects.link(ob)
+        created = True
+    if ob.type != "LIGHT":
+        return {"report": "%s is a %s object, not a light" % (ob.name, ob.type)}
+    ob.data.type = kind.upper()
+
+    energy = args.get("energy")
+    if energy is None:
+        energy = 3.0 if kind == "sun" else 1000.0
+    ob.data.energy = float(energy)
+    size = args.get("size")
+    if size is not None:
+        if kind == "area":
+            ob.data.size = float(size)
+        elif kind == "spot":
+            ob.data.spot_size = float(size)
+
+    target_name = (args.get("target") or "").strip()
+    target = bpy.data.objects.get(target_name) if target_name != "" else None
+    if target is None:
+        visible = [o for o in bpy.context.view_layer.objects if o.type != "LIGHT" and o != ob]
+        centre, span = bounds_of(visible if len(visible) > 0 else [ob])
+        target = None
+        point = centre
+    else:
+        point, span = bounds_of([target])
+
+    given = [args.get("x"), args.get("y"), args.get("z")]
+    if len([v for v in given if v is not None]) > 0:
+        location = (ob.location.x if given[0] is None else float(given[0]),
+                    ob.location.y if given[1] is None else float(given[1]),
+                    ob.location.z if given[2] is None else float(given[2]))
+    else:
+        location = (point.x + span, point.y - span, point.z + span * 1.2)
+    ob.location = location
+    ob.rotation_mode = "XYZ"
+    ob.rotation_euler = look_at_rotation(location, point)
+    bpy.context.view_layer.update()
+
+    lights = [o.name for o in bpy.data.objects if o.type == "LIGHT"]
+    lines = ["light %s%s: %s at energy %g" % (ob.name, " (created)" if created else " (updated)", ob.data.type.lower(), ob.data.energy)]
+    lines.append("at (%g, %g, %g), aimed at %s" % (location[0], location[1], location[2],
+                 target.name if target is not None else "the scene's objects"))
+    lines.append("%d light(s) in the file: %s" % (len(lights), ", ".join(lights)))
+    if kind == "sun":
+        lines.append("a sun has no falloff and no distance: energy is irradiance, and about 3 reads as daylight")
+    else:
+        lines.append("a %s light falls off with distance: energy is in watts, and 1000 is a lamp-sized default" % kind)
+    return {"report": "\n".join(lines)}
+
+
+
+def wireframe(args):
+    """Draw a mesh as text: front, side or top edge projections at true proportions."""
+    import bpy
+
+    # Inputs from the MCP tool. ARGS is set on the module before _main() runs.
+    name = args.get("name")
+    if not name:
+        return {"report": "wireframe needs the name of a mesh object"}
+
+    views = args.get("views") or ["front", "side"]
+    if not isinstance(views, (list, tuple)):
+        views = [views]
+
+    width = args.get("width") or 78
+    height = args.get("height") or 34
+    if width < 40:
+        width = 40
+    if width > 160:
+        width = 160
+    if height < 20:
+        height = 20
+    if height > 60:
+        height = 60
+    cols = int(width)
+    rows = int(height)
+
+    o = bpy.data.objects.get(name)
+    if o is None or o.type != "MESH":
+        return {"report": "no mesh object named " + str(name)}
+
+    me = o.data
+    mw = o.matrix_world
+    verts = [mw @ v.co for v in me.vertices]
+    edges = [(e.vertices[0], e.vertices[1]) for e in me.edges]
+    zs = [v.z for v in verts]
+    header = ("[wireframe v2] object " + o.name
+              + " dims " + str([round(v, 3) for v in o.dimensions])
+              + " faces " + str(len(me.polygons))
+              + " verts " + str(len(me.vertices))
+              + " edges " + str(len(me.edges))
+              + " world z " + str(round(min(zs), 3)) + " " + str(round(max(zs), 3)))
+
+
+    def axis_pair(view):
+        # One shared scale for both axes, so proportions are true.
+        if view == "front":
+            return (lambda v: v.x), (lambda v: v.z), "FRONT  x->right, z->up"
+        if view == "side":
+            return (lambda v: v.y), (lambda v: v.z), "SIDE   y->right, z->up"
+        if view == "top":
+            return (lambda v: v.x), (lambda v: v.y), "TOP    x->right, y->up"
+        raise ValueError("unknown view '" + str(view) + "'; use front, side or top")
+
+
+    def draw(ax, bz, label):
+        a0 = min(ax(v) for v in verts)
+        a1 = max(ax(v) for v in verts)
+        b0 = min(bz(v) for v in verts)
+        b1 = max(bz(v) for v in verts)
+        s = min((cols - 1) / ((a1 - a0) or 1.0), (rows - 1) / ((b1 - b0) or 1.0))
+        ca = (cols - 1 - (a1 - a0) * s) / 2
+        cb = (rows - 1 - (b1 - b0) * s) / 2
+        g = [[" "] * cols for _ in range(rows)]
+        for i, j in edges:
+            p = verts[i]
+            q = verts[j]
+            n = max(2, int(max(abs(ax(p) - ax(q)), abs(bz(p) - bz(q))) * s * 2))
+            for k in range(n + 1):
+                t = k / n
+                c = int(ca + (ax(p) * (1 - t) + ax(q) * t - a0) * s)
+                r = int(cb + (bz(p) * (1 - t) + bz(q) * t - b0) * s)
+                if 0 <= c < cols and 0 <= r < rows:
+                    g[rows - 1 - r][c] = "#"
+        lines = [label]
+        for row in g:
+            lines.append("".join(row).rstrip())
+        return "\n".join(lines)
+
+
+    parts = [header]
+    for view in views:
+        ax, bz, label = axis_pair(view)
+        parts.append(draw(ax, bz, label))
+    return {"report": "\n".join(parts)}
+
+def mesh_report(args):
+    """Measure a mesh: dimensions, bounds, loose parts and a face-orientation histogram."""
+    import bpy
+    import bmesh
+    from collections import Counter
+
+    name = args.get("name")
+    if not name:
+        return {"report": "mesh_report needs the name of a mesh object"}
+
+    o = bpy.data.objects.get(name)
+    if o is None or o.type != "MESH":
+        return {"report": "no mesh object named " + str(name)}
+
+    me = o.data
+    mw = o.matrix_world
+    world = [mw @ v.co for v in me.vertices]
+    lo = [round(min(v[i] for v in world), 3) for i in range(3)]
+    hi = [round(max(v[i] for v in world), 3) for i in range(3)]
+
+    lines = []
+    lines.append("object " + o.name)
+    lines.append("  dims " + str([round(v, 3) for v in o.dimensions])
+                 + " loc " + str([round(v, 3) for v in o.location])
+                 + " scale " + str([round(v, 3) for v in o.scale]))
+    lines.append("  world bbox " + str(lo) + " " + str(hi))
+    lines.append("  faces " + str(len(me.polygons))
+                 + " verts " + str(len(me.vertices))
+                 + " edges " + str(len(me.edges)))
+    lines.append("  materials " + str([m.name for m in me.materials]))
+    lines.append("  modifiers " + str([m.type for m in o.modifiers]))
+
+    # Loose parts: union-find over the mesh's edges, then each part's world bounds.
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    parent = list(range(len(bm.verts)))
+
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+
+    for e in bm.edges:
+        a = find(e.verts[0].index)
+        b = find(e.verts[1].index)
+        if a != b:
+            parent[a] = b
+
+    groups = {}
+    for v in bm.verts:
+        groups.setdefault(find(v.index), []).append(mw @ v.co)
+    bm.free()
+
+    lines.append("  loose parts " + str(len(groups)))
+    for g in sorted(groups.values(), key=lambda g: min(v.z for v in g)):
+        lines.append("    z " + str(round(min(v.z for v in g), 3))
+                     + " " + str(round(max(v.z for v in g), 3))
+                     + "  x " + str(round(min(v.x for v in g), 3))
+                     + " " + str(round(max(v.x for v in g), 3))
+                     + "  y " + str(round(min(v.y for v in g), 3))
+                     + " " + str(round(max(v.y for v in g), 3)))
+
+    # Face-orientation histogram: slab back vs slatted, lid vs wall.
+    hist = Counter()
+    for p in me.polygons:
+        n = p.normal
+        if abs(n.z) > 0.9:
+            hist["horizontal"] += 1
+        elif abs(n.x) > 0.9:
+            hist["side"] += 1
+        elif abs(n.y) > 0.9:
+            hist["front_back"] += 1
+        else:
+            hist["angled"] += 1
+    lines.append("  face orientation " + str(dict(hist)))
+
+    return {"report": "\n".join(lines)}
+
+def image_report(args):
+    """Describe an image as text: dimensions, aspect, mean and top colours, and two character grids."""
+    import bpy, numpy as np
+
+    source = args.get("source") or ""
+    cols = max(40, min(int(args.get("width") or 116), 200))
+    if source == "":
+        return {"report": "image_report needs an image already in the file, by name, or a path to load"}
+
+    src = bpy.data.images.get(source)
+    loaded = src is None
+    if loaded:
+        try:
+            src = bpy.data.images.load(source)
+        except Exception as e:
+            return {"report": "cannot load %s: %s" % (source, e)}
+    img = src
+    ow, oh = img.size
+    buf = np.empty(ow * oh * 4, dtype=np.float32)
+    img.pixels.foreach_get(buf)
+    a = buf.reshape(oh, ow, 4)[::-1, :, :3]
+
+    lum = 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+    mean = [int(round(a[..., i].mean() * 255)) for i in range(3)]
+    q = (np.clip(a, 0, 1) * 15).astype(np.uint8).reshape(-1, 3)
+    keys = q[:, 0].astype(np.int32) * 256 + q[:, 1].astype(np.int32) * 16 + q[:, 2]
+    uniq, counts = np.unique(keys, return_counts=True)
+    total = float(keys.size)
+    palette = ["#%02x%02x%02x %2.0f%%" % ((int(uniq[i]) // 256) * 17, ((int(uniq[i]) // 16) % 16) * 17,
+                                          (int(uniq[i]) % 16) * 17, 100.0 * counts[i] / total)
+               for i in np.argsort(-counts)[:6]]
+
+    mx = a.max(axis=2)
+    mn = a.min(axis=2)
+    den = np.maximum(mx - mn, 1e-6)
+    sat = np.where(mx > 0.01, (mx - mn) / np.maximum(mx, 1e-6), 0.0)
+    hue = np.where(mx == a[..., 0], ((a[..., 1] - a[..., 2]) / den) % 6,
+                   np.where(mx == a[..., 1], (a[..., 2] - a[..., 0]) / den + 2,
+                            (a[..., 0] - a[..., 1]) / den + 4)) * 60.0
+
+    rows = max(6, int(round(cols * (oh / float(ow)) / 2.0)))   # 2:1 cell, true proportions
+    ys = np.linspace(0, oh, rows + 1).astype(int)
+    xs = np.linspace(0, ow, cols + 1).astype(int)
+    grid = np.zeros((rows, cols), dtype=np.float32)
+    for r in range(rows):
+        for c in range(cols):
+            cell = lum[ys[r]:ys[r + 1], xs[c]:xs[c + 1]]
+            grid[r, c] = float(cell.mean()) if cell.size else 0.0
+    lo, hi = np.percentile(grid, 5), np.percentile(grid, 95)
+    span = float(hi - lo) or 1.0
+    tone_ramp = " .:-=+*#%@"
+    hue_ramp = "RYGCBM"
+
+    tone = []
+    hues = []
+    for r in range(rows):
+        tline = ""
+        hline = ""
+        for c in range(cols):
+            v = (grid[r, c] - lo) / span
+            tline += tone_ramp[max(0, min(len(tone_ramp) - 1, int(v * (len(tone_ramp) - 1))))]
+            cs = sat[ys[r]:ys[r + 1], xs[c]:xs[c + 1]]
+            ch = hue[ys[r]:ys[r + 1], xs[c]:xs[c + 1]]
+            hline += "." if (cs.size == 0 or float(cs.mean()) < 0.18) else hue_ramp[int(float(ch.mean()) // 60) % 6]
+        tone.append(tline)
+        hues.append(hline)
+
+    lines = ["image %s  %dx%d  aspect %.3f  mean #%02x%02x%02x  grid %dx%d"
+             % (source, ow, oh, (ow / float(oh) if oh else 0), mean[0], mean[1], mean[2], cols, rows),
+             "palette " + ", ".join(palette),
+             "tone, dense = bright:"]
+    lines.extend(tone)
+    lines.append("hue: R red  Y yellow  G green  C cyan  B blue  M magenta  . grey or desaturated")
+    lines.extend(hues)
+
+    if loaded:
+        bpy.data.images.remove(img)
+    return {"report": "\n".join(lines)}
+
+@undoable
+def modifier(args):
+    """Add, remove or list one modifier, with the setting that matters typed."""
+    import bpy
+
+    KINDS = {"subdivision": "SUBSURF", "bevel": "BEVEL", "mirror": "MIRROR",
+             "solidify": "SOLIDIFY", "decimate": "DECIMATE", "wireframe": "WIREFRAME"}
+    name = (args.get("name") or "").strip()
+    ob = bpy.data.objects.get(name)
+    if ob is None:
+        return {"report": "modifier needs the exact name of an object; scene lists them"}
+    if ob.type != "MESH":
+        return {"report": "%s is a %s object; these modifiers need a mesh" % (ob.name, ob.type)}
+    action = (args.get("action") or "add").lower()
+
+    def counted():
+        base = len(ob.data.polygons)
+        shown = base
+        try:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            shown = len(ob.evaluated_get(depsgraph).data.polygons)
+        except Exception:
+            pass
+        return (base, shown)
+
+    if action == "list":
+        lines = ["%s carries %d modifier(s):" % (ob.name, len(ob.modifiers))]
+        for i, m in enumerate(ob.modifiers):
+            lines.append("  %d: %s [%s]%s" % (i, m.name, m.type, "" if m.show_render else " (hidden from renders)"))
+        if len(ob.modifiers) == 0:
+            lines.append("  none")
+        base, shown = counted()
+        lines.append("faces %d in the mesh, %d with them applied" % (base, shown))
+        return {"report": "\n".join(lines)}
+
+    kind = (args.get("kind") or "").strip().lower()
+    if kind not in KINDS:
+        return {"report": "kind must be one of %s" % ", ".join(sorted(KINDS))}
+    if action == "remove":
+        target = None
+        for m in ob.modifiers:
+            if m.type == KINDS[kind]:
+                target = m
+                break
+        if target is None:
+            return {"report": "%s has no %s modifier to remove; action list shows what it has" % (ob.name, kind)}
+        removed = target.name
+        ob.modifiers.remove(target)
+        bpy.context.view_layer.update()
+        return {"report": "removed modifier %s (%s) from %s; %d left: %s"
+                % (removed, kind, ob.name, len(ob.modifiers), ", ".join(m.name for m in ob.modifiers) or "none")}
+    if action != "add":
+        return {"report": "action must be add, remove or list, not %r" % action}
+
+    existing = None
+    for m in ob.modifiers:
+        if m.type == KINDS[kind]:
+            existing = m
+            break
+    fresh = existing is None
+    mod = existing if existing is not None else ob.modifiers.new(kind.title(), KINDS[kind])
+    count = args.get("count")
+    amount = args.get("amount")
+    axis = (args.get("axis") or "").lower()
+    used = []
+    if kind == "subdivision":
+        if count is not None:
+            mod.levels = int(count)
+            mod.render_levels = int(count)
+        used.append("levels %d" % mod.levels)
+    elif kind == "bevel":
+        if amount is not None:
+            mod.width = float(amount)
+        used.append("width %g" % mod.width)
+        used.append("segments %d" % mod.segments)
+    elif kind == "mirror":
+        if axis in ("x", "y", "z"):
+            mod.use_axis = (axis == "x", axis == "y", axis == "z")
+        used.append("axis %s" % "".join(a for a, on in zip("XYZ", mod.use_axis) if on))
+    elif kind == "solidify":
+        if amount is not None:
+            mod.thickness = float(amount)
+        used.append("thickness %g" % mod.thickness)
+    elif kind == "decimate":
+        if amount is not None:
+            mod.ratio = max(0.0, min(float(amount), 1.0))
+        used.append("ratio %g" % mod.ratio)
+    elif kind == "wireframe":
+        if amount is not None:
+            mod.thickness = float(amount)
+        used.append("thickness %g" % mod.thickness)
+    bpy.context.view_layer.update()
+
+    applied = False
+    note = ""
+    if args.get("apply"):
+        for o in list(bpy.context.selected_objects):
+            o.select_set(False)
+        bpy.context.view_layer.objects.active = ob
+        ob.select_set(True)
+        try:
+            bpy.ops.object.modifier_apply(modifier=mod.name)
+            applied = True
+        except Exception as e:
+            note = "could not apply it (%s), so it stays live" % e
+    base, shown = counted()
+    lines = ["%s: %s modifier %s" % (ob.name, kind, "created" if fresh else "updated")]
+    lines.append("settings: %s" % (", ".join(used) if len(used) > 0 else "none given; the defaults stand"))
+    lines.append("faces %d in the mesh, %d with the modifiers applied" % (base, shown))
+    lines.append("modifiers on %s: %s" % (ob.name, ", ".join("%s [%s]" % (m.name, m.type) for m in ob.modifiers)))
+    if note != "":
+        lines.append(note)
+    lines.append("mesh_report and wireframe read the base mesh, so they still see %d faces" % base)
+    return {"report": "\n".join(lines)}
+
+
 if __name__ == "__main__":
     import json
     import sys
 
     entries = {"reveal": reveal, "text": text, "place": place, "material": material,
-               "render": render, "export": export, "remove": remove}
+               "render": render, "export": export, "remove": remove, "duplicate": duplicate,
+               "array": array, "boolean": boolean, "aim": aim, "light": light, "wireframe": wireframe,
+               "mesh_report": mesh_report, "image_report": image_report, "modifier": modifier}
     wanted = sys.argv[1] if len(sys.argv) > 1 else ""
     payload = sys.argv[2] if len(sys.argv) > 2 else "{}"
     if wanted not in entries:

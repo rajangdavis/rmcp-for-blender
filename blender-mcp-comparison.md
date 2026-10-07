@@ -1,8 +1,8 @@
 # MCP for Blender (Python) vs the rmcp_dsl Rust server
 
 The Python server (`src/blender_mcp/server.py`) exposes ~14 MCP tools that wrap
-the addon's ~37 socket commands. The Rust server (`blender.rmcp.rb`) exposes 21
-tools: twenty typed tools, plus one generic `command`
+the addon's ~37 socket commands. The Rust server (`blender.rmcp.rb`) exposes 26
+tools: twenty-five typed tools, plus one generic `command`
 tool carrying every command name as an enum and a JSON `args` string.
 
 ## Tool mapping
@@ -32,6 +32,11 @@ tool carrying every command name as an enum and a JSON `args` string.
 | — (no Python equivalent) | — | `render` | extension: render to a PNG at a chosen resolution and sample count and leave the file on disk |
 | — (Python exposes none) | `export_scene` | `export` | script: named objects with their children to glb or fbx, path resolved beside the .blend, reporting what was skipped |
 | — (no Python equivalent) | — | `remove` | extension: delete named objects and report the cost — children left unparented, data the orphan purge freed, what remains |
+| — (no Python equivalent) | — | `duplicate` | extension: copy objects with a fixed offset per copy, whole or linked to the original's mesh |
+| `array` modifier | — | `array` | extension: add or update an array modifier (count, axis, constant or relative offsets), reporting base and evaluated face counts |
+| `boolean` modifier | — | `boolean` | extension: difference, union or intersect against a named operand, applied or live, with a face count that shows a cut that missed |
+| — (no Python equivalent) | — | `aim` | extension: place and orient a camera to frame a target from a named side, fitting its size to the lens |
+| — (no Python equivalent) | — | `light` | extension: create or adjust a light, aimed at an object or the scene, reporting type, energy and every light in the file |
 | `open_viewport` (app-only) | viewport resource | `screenshot` | the image is returned inline instead of beside the chat |
 | `viewport_latest` (app-only) | — | — | an MCP resource/UI concept, not an agent tool |
 | `record_trajectory_feedback` | trajectory/telemetry | — | intentionally out of scope |
@@ -66,13 +71,21 @@ reach through `command`: `ping`, `get_world_state_snapshot`, `bpy_api_lookup`,
   server can only return images whose base64 the agent cannot read (see
   `text-vision-tools.md`). A 78x34 wireframe is ~1 KB; a 600x381 screenshot is
   ~80 KB.
-- **Seven scene and output tools with no Python equivalent.** `reveal`, `text`,
-  `place`, `material`, `remove`, `render` and `export` cover the loop the Python
-  server leaves to `execute_blender_code`: find out why nothing is on screen,
-  make something, position it, colour it, delete it again, render it, and hand
-  the result over as a file. They run `python/mcp_scripts.py`, which is a real
-  Python module rather than a string constant, installed into Blender once per
-  content hash.
+- **Twelve scene and output tools with no Python equivalent.** `reveal`, `text`,
+  `place`, `material`, `remove`, `duplicate`, `array`, `boolean`, `aim`, `light`,
+  `render` and `export` cover the loop the Python server leaves to
+  `execute_blender_code`: find out why nothing is on screen, make something,
+  copy and stack it, cut it, position it, aim a camera at it, light it, colour
+  it, delete it again, render it, and hand the result over as a file. They run
+  `python/mcp_scripts.py`, a real Python module rather than a string constant,
+  installed into Blender once per content hash.
+- **Agent-facing material ships with the tools.** Upstream carries seven guides
+  (`scene`, `materials`, `rigging`, `animation`, `retopology`, `level-design`,
+  `bpy`) and a Codex plugin whose manifest carries default prompts
+  (`"Add a wooden chair from Poly Pizza"`). This server's equivalent is
+  `blender-tools/SKILL.md`: the tool-by-task map, the loop that works, and the
+  report signatures worth recognising — a flat grey render, `faces 499 -> 0`, a
+  loose-part count, and the two face counts a modifier reports.
 - **Captures are per-call.** `look`/`screenshot` write
   `$TMPDIR/mcp-blender-<kind>-<pid>-<n>.png` and delete the file after reading,
   so concurrent callers cannot read each other's image. The Python server uses
@@ -104,7 +117,7 @@ reach through `command`: `ping`, `get_world_state_snapshot`, `bpy_api_lookup`,
 
 ## Status
 
-The mapping above is current: 20 Rust tools against the Python server's ~14.
+The mapping above is current: 26 Rust tools against the Python server's ~14.
 Every Python agent tool has a typed counterpart, and the six scene and output
 tools have no Python equivalent at all; the Python server's app-only viewport
 tools (`viewport_capture` via `screenshot`, `viewport_pick` via `command`) stay
@@ -140,3 +153,11 @@ are typed and their failure paths were exercised for real — Tripo answers with
 Premium refusal, the Rodin trial key reports `API_INSUFFICIENT_FUNDS`, and the
 Hunyuan3D `LOCAL_API` refuses connections — but no provider has yet been watched
 through to an imported model.
+
+An `undo` tool was written and then **removed**. The boundary mechanism works:
+every mutating tool opens an undo step via `bpy.ops.ed.undo_push`, and one step
+reverted a `text` call exactly. But a removal made through Blender's data API did
+not come back, and a single-step test ended the session — Blender turned off. The
+details, and the operator-versus-data-API hypothesis behind the asymmetry, are in
+`blender-notes.md`. The boundary decorator stays, because it makes the user's own
+undo land on a tool call's boundary; the tool does not.

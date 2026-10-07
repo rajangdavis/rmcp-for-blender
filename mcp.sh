@@ -52,8 +52,8 @@ stdout() {
            else (($r.structuredContent.output) // ($r.content[0].text) // "") end'
 }
 case "${1:-}" in
-  tool) [ $# -eq 3 ] || { echo "usage: bash mcp.sh tool NAME 'JSON'" >&2; exit 2; }
-        post "$(call 2 "$2" "$3")" | blocks ;;
+  tools) post '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq -r '.result.tools[]?.name' ;;
+  tool)        post "$(call 2 "$2" "$3")" | blocks ;;
   code) [ $# -eq 2 ] || { echo "usage: bash mcp.sh code FILE.py" >&2; exit 2; }
         post "$(call 2 execute_code "$(jq -nc --rawfile c "$2" '{code:$c}')")" | stdout ;;
   raw)  [ $# -eq 2 ] || { echo "usage: bash mcp.sh raw FILE" >&2; exit 2; }

@@ -1,6 +1,7 @@
 # typed: true
 server "blender", version: "0.1.0", instructions: "MCP for Blender drives the user's live Blender. execute_code runs Python there with the full bpy API, so anything Blender can do, you can do; screenshot and look show you the result.\n\nStart with command(name: \"get_addon_info\") (Blender version, which libraries and generators are on) and scene_info.\n\nScripts run in someone else's Blender:\n- Look shader nodes up by type, never by name (names are localized): next(n for n in mat.node_tree.nodes if n.type == \"BSDF_PRINCIPLED\").\n- Never hardcode enum identifiers; read them, for example [i.identifier for i in bpy.types.RenderSettings.bl_rna.properties[\"file_format\"].enum_items]. scene.render.engine under-reports: read the current value, and assign a new one inside try/except TypeError, whose message lists the valid engines.\n- Material colors go on shader node inputs; material.diffuse_color only affects the viewport.\n\nlook is how you see your work; use it as much as you need. Images stay in the conversation, so a smaller max_size keeps long sessions cheap.\n\nObjects can also come from existing libraries (search_assets, then import_asset: Poly Haven, Sketchfab, Poly Pizza) or be made to order (generate_3d: one new textured model from text or an image, 1-3 minutes, may cost the user a credit). A generation is one object, never a whole scene, the ground or parts to assemble. Imported and generated models arrive at arbitrary scale: use the reported world_bounding_box to size them and put them on the ground." do
   use_bindings :json
+  use_bindings :imagefile
 
   # The addon bridge lives in hand-written Rust beside this file: one persistent
   # connection, one command at a time, the reply back as JSON text.
@@ -29,11 +30,18 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   rust_fn :gen_path_suffix, args: [:string], returns: :string, from: :blender_gen
   rust_fn :trim_text, args: [:string], returns: :string, from: :blender_gen
 
+  # Reading an image as text, but in Rust rather than inside Blender: the
+  # arithmetic is unit-testable with cargo test and needs no Blender session.
+  # The image crate is declared in bindings/imagefile.rb; dependencies land in
+  # the crate's Cargo.toml, so this module can use it directly.
+  rust_file "textvision.rs", as: :textvision
+  rust_fn :grid, args: [:string, :i32], returns: :string, from: :textvision
+  rust_fn :ansi, args: [:string, :i32, :string, :string], returns: :string, from: :textvision
+
   setting :blender_host, env: "BLENDER_HOST", default: "localhost", description: "host of the Blender addon bridge"
   setting :blender_port, env: "BLENDER_PORT", default: "9876", description: "port of the Blender addon bridge"
   setting :blender_scripts, env: "BLENDER_SCRIPTS", default: "vendor/mcp-for-blender/src/blender_mcp/blender_scripts.py", description: "path to the addon's blender_scripts.py, whose scripts this server runs inside Blender"
   setting :mcp_token, env: "MCP_TOKEN", secret: true, description: "bearer token every request to the HTTP transport must carry; required, so every run needs MCP_TOKEN set"
-  setting :blender_extras, env: "BLENDER_EXTRAS", default: "mcp_extras.py", description: "path to mcp_extras.py, whose WIREFRAME and MESH_REPORT scripts this server runs inside Blender"
   setting :blender_python, env: "BLENDER_PYTHON", default: "python/mcp_scripts.py", description: "path to the Python module the scene and output tools run: a real module, read here and installed into Blender once per content hash"
 
   # One command over the bridge: send, check the addon's status, and return the
@@ -546,7 +554,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
        output: :TextReport, read_only: true, open_world: true do
     body do |name, views, width, height|
       args = "{\"name\":#{Json.quote(name)},\"views\":#{Json.str_list_json(views || [])},\"width\":#{width},\"height\":#{height}}"
-      data = Json.parse(run_script(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_extras), "WIREFRAME", args)) || raise("could not parse the wireframe result")
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "wireframe", args)) || raise("could not parse the wireframe result")
       result(:TextReport, report: Json.text(data, "/report") || raise("the wireframe script returned no text"))
     end
   end
@@ -561,8 +569,24 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
        output: :TextReport, read_only: true, open_world: true do
     body do |source, width|
       args = "{\"source\":#{Json.quote(source)},\"width\":#{width}}"
-      data = Json.parse(run_script(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_extras), "IMAGE_REPORT", args)) || raise("could not parse the image report")
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "image_report", args)) || raise("could not parse the image report")
       result(:TextReport, report: Json.text(data, "/report") || raise("the image script returned no text"))
+    end
+  end
+
+  params :ImageReportRustParams do
+    field :source, :string, description: "Path to an image file on the machine this server runs on"
+    field :width, :i32, description: "Cells across; rows follow the image's aspect at 2:1 cells", default: 96, min: 40, max: 200
+  end
+
+  tool :image_report_rust, params: :ImageReportRustParams, title: "Read an image as text (Rust)",
+       description: "The same job as image_report, and more, computed in this server's own Rust rather than inside Blender: dimensions, aspect, mean and the most common colours, a tone grid, a hue-and-strength grid (case carries saturation), a spectrum ordered by hue, and a summary naming what is in the picture and roughly where. It reads the file itself, so it needs no Blender session and works while the addon is stopped. Kept beside image_report so one picture can go through both and the texts compared.",
+       output: :TextReport, read_only: true, open_world: true do
+    body do |source, width|
+      report = rust(:grid, source, width)
+      bytes = ImageFile.size(source)
+      measured = if bytes.nil? then report else "#{report}\nfile #{bytes || 0} bytes" end
+      result(:TextReport, report: measured)
     end
   end
 
@@ -680,6 +704,156 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     end
   end
 
+  # --- Modelling: copy, stack, cut, light, and put the camera where it belongs ---
+
+  params :DuplicateParams do
+    field :names, :string_list, description: "Exact names of the objects to copy"
+    field :count, :i32, description: "How many copies of each", default: 1, min: 1, max: 200
+    field :dx, :f64, description: "Offset per copy along X, in metres", default: 0.0
+    field :dy, :f64, description: "Offset per copy along Y, in metres", default: 0.0
+    field :dz, :f64, description: "Offset per copy along Z, in metres", default: 0.0
+    field :linked, :bool, description: "Share the original's mesh data instead of copying it", default: false
+  end
+
+  tool :duplicate, params: :DuplicateParams, title: "Copy objects",
+       description: "Copy one or more objects, offsetting each copy by a fixed step, so one generated chair becomes a row. Full copies by default, each with its own mesh; linked copies share the original's data and change together. Copies land in the original's collections and keep its parent.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |names, count, dx, dy, dz, linked|
+      listed = Json.str_list_json(names)
+      args = "{\"names\":#{listed},\"count\":#{count},\"dx\":#{dx},\"dy\":#{dy},\"dz\":#{dz},\"linked\":#{linked}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "duplicate", args)) || raise("could not parse the copy report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("duplicate returned no text"))
+    end
+  end
+
+  params :ArrayParams do
+    field :name, :string, description: "Exact name of the mesh object to stack"
+    field :count, :i32, description: "How many copies the modifier makes, the original included", default: 3, min: 1, max: 1000
+    field :mode, :string, description: "constant: offsets are metres; relative: they are factors of the object's own size", enum: ["constant", "relative"], default: "constant"
+    field :offset_x, :f64, description: "Offset per copy along X; unset uses the object's width", optional: true
+    field :offset_y, :f64, description: "Offset per copy along Y; unset is 0", optional: true
+    field :offset_z, :f64, description: "Offset per copy along Z; unset is 0", optional: true
+  end
+
+  tool :array, params: :ArrayParams, title: "Stack copies with a modifier",
+       description: "Add or update an array modifier on one mesh, so it repeats along an axis without duplicating objects: the row follows the original, and renders and exports apply it. mesh_report and wireframe read the base mesh, so they still see a single copy.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |name, count, mode, offset_x, offset_y, offset_z|
+      qx = if offset_x.nil? then "null" else offset_x.to_s end
+      qy = if offset_y.nil? then "null" else offset_y.to_s end
+      qz = if offset_z.nil? then "null" else offset_z.to_s end
+      args = "{\"name\":#{Json.quote(name)},\"count\":#{count},\"mode\":#{Json.quote(mode)},\"offset_x\":#{qx},\"offset_y\":#{qy},\"offset_z\":#{qz}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "array", args)) || raise("could not parse the array report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("array returned no text"))
+    end
+  end
+
+  params :BooleanParams do
+    field :name, :string, description: "Exact name of the object to modify"
+    field :operand, :string, description: "Exact name of the second object: the cutter, the joiner or the overlap"
+    field :operation, :string, description: "difference cuts the operand out, union joins it in, intersect keeps only the overlap", enum: ["difference", "union", "intersect"], default: "difference"
+    field :apply, :bool, description: "Apply the modifier into the mesh instead of leaving it live", default: true
+    field :hide_operand, :bool, description: "Hide the operand afterwards, as a cutter usually is", default: true
+  end
+
+  tool :boolean, params: :BooleanParams, title: "Cut or join two meshes",
+       description: "Boolean one mesh against another and report the result's face count, so a cut that missed shows up now rather than at render time. Applied by default, which changes the mesh itself; with apply false it stays a live modifier. Both must be meshes, and a difference needs them to overlap.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |name, operand, operation, apply, hide_operand|
+      args = "{\"name\":#{Json.quote(name)},\"operand\":#{Json.quote(operand)},\"operation\":#{Json.quote(operation)},\"apply\":#{apply},\"hide_operand\":#{hide_operand}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "boolean", args)) || raise("could not parse the boolean report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("boolean returned no text"))
+    end
+  end
+
+  params :AimParams do
+    field :target, :string, description: "Exact name of the object the camera should frame"
+    field :camera, :string, description: "Camera to move; unset uses the scene camera, creating one if there is none", optional: true
+    field :view, :string, description: "Which side to stand on", enum: ["three_quarter", "front", "back", "left", "right", "top"], default: "three_quarter"
+    field :distance, :f64, description: "Metres from the target; unset fits the target's size to the lens", optional: true, min: 0.0
+    field :lens, :f64, description: "Focal length in millimetres; unset keeps the camera's own", optional: true, min: 1.0
+  end
+
+  tool :aim, params: :AimParams, title: "Point the camera at something",
+       description: "Put a camera where it frames a target, from a named side, at a distance that fits the target's size to the lens, and make it the scene camera. This is what makes render and look show the subject: a camera left facing the wrong way renders a flat grey world and nothing else reports that. Use place afterwards for an exact transform.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |target, camera, view, distance, lens|
+      wanted_camera = camera || ""
+      qdistance = if distance.nil? then "null" else distance.to_s end
+      qlens = if lens.nil? then "null" else lens.to_s end
+      args = "{\"target\":#{Json.quote(target)},\"camera\":#{Json.quote(wanted_camera)},\"view\":#{Json.quote(view)},\"distance\":#{qdistance},\"lens\":#{qlens}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "aim", args)) || raise("could not parse the camera report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("aim returned no text"))
+    end
+  end
+
+  params :LightParams do
+    field :name, :string, description: "Light to adjust; unset creates one", optional: true
+    field :kind, :string, description: "sun is even and distance-independent; point, area and spot fall off", enum: ["sun", "point", "area", "spot"], default: "sun"
+    field :energy, :f64, description: "Sun: irradiance, where 3 reads as daylight. Others: watts, where 1000 is a lamp. Unset uses those", optional: true, min: 0.0
+    field :size, :f64, description: "Area size in metres, or spot angle in degrees", optional: true, min: 0.0
+    field :target, :string, description: "Object to aim at; unset aims at the middle of the scene's objects", optional: true
+    field :x, :f64, description: "X in metres; unset places it above and in front of the subject", optional: true
+    field :y, :f64, description: "Y in metres; unset places it above and in front of the subject", optional: true
+    field :z, :f64, description: "Z in metres; unset places it above and in front of the subject", optional: true
+  end
+
+  tool :light, params: :LightParams, title: "Make or move a light",
+       description: "Create a light or adjust one that exists, aimed at an object or at the middle of the scene, so a render is lit on purpose rather than by whatever the file came with. Reports the type, energy and target, and lists every light in the file. A sun is the steady choice for a quick look; the others fall off with distance.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |name, kind, energy, size, target, x, y, z|
+      wanted_name = name || ""
+      wanted_target = target || ""
+      qenergy = if energy.nil? then "null" else energy.to_s end
+      qsize = if size.nil? then "null" else size.to_s end
+      qx = if x.nil? then "null" else x.to_s end
+      qy = if y.nil? then "null" else y.to_s end
+      qz = if z.nil? then "null" else z.to_s end
+      args = "{\"name\":#{Json.quote(wanted_name)},\"kind\":#{Json.quote(kind)},\"energy\":#{qenergy},\"size\":#{qsize},\"target\":#{Json.quote(wanted_target)},\"x\":#{qx},\"y\":#{qy},\"z\":#{qz}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "light", args)) || raise("could not parse the light report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("light returned no text"))
+    end
+  end
+
+  params :ModifierParams do
+    field :name, :string, description: "Exact name of the mesh object"
+    field :action, :string, description: "add creates or updates one, remove takes the first of that kind off, list reports what is there", enum: ["add", "remove", "list"], default: "add"
+    field :kind, :string, description: "Which modifier; required for add and remove", enum: ["subdivision", "bevel", "mirror", "solidify", "decimate", "wireframe"], optional: true
+    field :count, :i32, description: "subdivision: viewport levels. Unset keeps what is there", optional: true, min: 0, max: 8
+    field :amount, :f64, description: "bevel, solidify or wireframe thickness in metres; decimate ratio 0-1. Unset keeps the modifier's own value", optional: true
+    field :axis, :string, description: "mirror: which axis to mirror on", enum: ["x", "y", "z"], optional: true
+    field :apply, :bool, description: "Apply it into the mesh instead of leaving it live", default: false
+  end
+
+  tool :modifier, params: :ModifierParams, title: "Add or remove a modifier",
+       description: "Add, remove or list one modifier on a mesh: subdivision, bevel, mirror, solidify, decimate or wireframe, with the setting that matters for that kind typed. The report gives the base and evaluated face counts, so an effect that did nothing is visible rather than assumed. The long tail of modifier properties is not typed; use command or execute_code when a specific one is needed.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |name, action, kind, count, amount, axis, apply|
+      wanted_kind = kind || ""
+      wanted_axis = axis || ""
+      qcount = if count.nil? then "null" else count.to_s end
+      qamount = if amount.nil? then "null" else amount.to_s end
+      args = "{\"name\":#{Json.quote(name)},\"action\":#{Json.quote(action)},\"kind\":#{Json.quote(wanted_kind)},\"count\":#{qcount},\"amount\":#{qamount},\"axis\":#{Json.quote(wanted_axis)},\"apply\":#{apply}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "modifier", args)) || raise("could not parse the modifier report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("modifier returned no text"))
+    end
+  end
+
+  params :ImageViewParams do
+    field :source, :string, description: "Path to an image file on the machine this server runs on"
+    field :width, :i32, description: "Cells across", default: 64, min: 20, max: 200
+    field :mode, :string, description: "half: two samples stacked, two colours. braille: eight samples (a 4x2 dot grid) as one dithered glyph, four times the vertical detail. blend: the same eight samples with two colours, the lit dots in front and the gaps behind", enum: ["half", "braille", "blend"], default: "blend"
+    field :dither, :string, description: "diffusion: Floyd-Steinberg, where each dot's rounding error spills into its neighbours, giving irregular dots that read as tone. ordered: a 4x4 Bayer threshold, regular by construction and so more textured. threshold: a hard 50% cut", enum: ["diffusion", "ordered", "threshold"], default: "diffusion"
+  end
+
+  tool :image_view, params: :ImageViewParams, title: "Show an image in the terminal",
+       description: "The image itself, as truecolour text for a human to look at, in three modes: half draws two stacked samples per cell with two colours; braille draws a dithered 4x2 dot grid as one glyph, four times the vertical detail, which makes a flat tone read as tone; blend does braille with the lit dots in one colour and the gaps in another, so shape and colour both survive. This is for eyes, not for a model: a text model should read image_report or image_report_rust, which cost a fraction of the tokens. It needs a client that passes ANSI through, a terminal that renders truecolour, and a font carrying braille and block glyphs.",
+       output: :TextReport, read_only: true, open_world: true do
+    body do |source, width, mode, dither|
+      result(:TextReport, report: rust(:ansi, source, width, mode, dither))
+    end
+  end
+
   output :FileReport do
     field :path, :string, description: "Absolute path of the file that was written"
     field :report, :string, description: "Plain text: what was written and with what settings"
@@ -739,7 +913,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
        output: :TextReport, read_only: true, open_world: true do
     body do |name|
       args = "{\"name\":#{Json.quote(name)}}"
-      data = Json.parse(run_script(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_extras), "MESH_REPORT", args)) || raise("could not parse the mesh report")
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "mesh_report", args)) || raise("could not parse the mesh report")
       result(:TextReport, report: Json.text(data, "/report") || raise("the mesh report script returned no text"))
     end
   end
