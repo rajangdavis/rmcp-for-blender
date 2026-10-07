@@ -50,9 +50,54 @@ notify() {
   fi
 }
 
+# The Python module the tools run is read at call time, so editing it needs no
+# rebuild - but it should not wait for a Blender call to prove it parses. uv is
+# what this repo already uses for Python (the vendored addon carries a
+# .python-version and a uv venv), so try it first and fall back to whatever
+# python3 the machine has. Whichever wins is proved here, at startup, rather
+# than discovered at lint time; the check is ast.parse, so no bpy import and no
+# bytecode written into the tree.
+pick_python() {
+  for candidate in "uv run --quiet --no-project python" "python3" "python"; do
+    if $candidate -c 'import ast' >/dev/null 2>&1; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+PYRUN="$(pick_python || true)"
+pystamp() { cat python/mcp_scripts.py mcp_extras.py 2>/dev/null | shasum -a 256 | cut -c1-16; }
+lint() {
+  if [ -z "$PYRUN" ]; then
+    echo "$(date +%T) lint    no uv and no python3 here, so the Python was not checked"
+    return 0
+  fi
+  if $PYRUN -c 'import ast, sys
+for path in sys.argv[1:]:
+    try:
+        ast.parse(open(path).read(), path)
+    except SyntaxError as e:
+        print("%s:%s: %s" % (path, e.lineno, e.msg))
+        sys.exit(1)' python/mcp_scripts.py mcp_extras.py >"$BUILDLOG" 2>&1; then
+    echo "$(date +%T) lint    the Python parses (via $PYRUN)"
+  else
+    echo "$(date +%T) LINT    the Python does not parse:"
+    cat "$BUILDLOG"
+    notify "Python lint failed: $(head -n 1 "$BUILDLOG")"
+  fi
+}
+
+lastpy=""
 last=""
 while true; do
+  nowpy=$(pystamp)
+  if [ "$nowpy" != "$lastpy" ]; then
+    lastpy="$nowpy"
+    lint
+  fi
   now=$(stamp)
+  if [ "$now" != "$last" ]; then
   if [ "$now" != "$last" ]; then
     last="$now"
     if rmcp_dsl check blender.rmcp.rb >"$BUILDLOG" 2>&1; then

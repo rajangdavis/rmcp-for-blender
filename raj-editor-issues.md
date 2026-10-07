@@ -209,3 +209,65 @@ Two habits worth keeping:
 - **One writer per file.** `dev.sh` now refuses to start twice for the same
   reason; a background agent counts as a writer.
 
+## 12. `claim` resolves a relative path against the agent's cwd, `edit` against the workspace root
+
+**What happened.** With a shell sitting in `/tmp/rajwork`,
+`raj ctl claim blender-mcp-comparison.md` reported
+`claimed 1 file(s): /tmp/rajwork/blender-mcp-comparison.md`. One call later,
+`raj ctl edit blender-mcp-comparison.md` — the same relative string — edited
+`/work/blender-mcp-comparison.md` and worked. The mismatch surfaced only when the
+*next* file was refused for not being in the claim set.
+
+**Why it matters.** The claim set is the writers' mutual exclusion. If the name
+that goes into it is not the name that gets written, the exclusion protects the
+wrong path while reporting a path the user has never seen — and the failure reads
+as a claim problem rather than a path problem.
+
+**Suggested fix.** Resolve every path argument one way, against the workspace
+root, and echo the resolved absolute path on `claim` so the two calls can be
+compared by eye.
+
+## 13. A claim outlives the identity that made it, and the warning never expires
+
+**What happened.** Claiming `blender.rmcp.rb` printed
+`also claimed by raj-e707e4fe` and `also claimed by raj-54a0595a` on every attempt.
+Neither key appears in `who`, live or not: they are from sessions that have ended.
+The writes were not blocked, only warned about.
+
+**Why it matters.** The one message that should mean "stop, another agent is
+writing this file" is permanently lit on any file with history, so it stops
+carrying information exactly where it matters most — the file a second agent is
+about to touch for real. Issue 11 is what a missing signal costs.
+
+**Suggested fix.** Release a connection's claims when the connection goes away
+(the editor already tracks `gone`), and separate the two cases in the wording:
+*claimed by a live peer*, worth heeding, against *left over from an ended
+session*, which the next claimant could take over with a note that it did.
+
+## 14. A daemon restart drops unsaved buffers without warning
+
+**What happened.** After a session with six buffers dirty, the editor's daemon
+was restarted. Every buffer came back reported `saved`: the unsaved text was
+gone, with no notice, no recovery file and no prompt on the way down. The two
+files whose content existed only in a buffer — `blender.rmcp.rb` (the `remove`
+tool, 15 lines) and `dev.sh` (the Python lint, 43 lines) — reverted to their
+last saved state. Three docs that had already reached disk were unaffected.
+
+**Why it matters.** Unsaved buffers are the point of the arrangement: an agent's
+writes land there as proposals, the user reviews and saves. A restart that
+silently discards them turns the review gate into a data-loss window, and it
+does so exactly when the buffer holds the most work — the tail of a session. An
+agent's edits are usually recoverable from its own scratch; the user's unsaved
+typing is not.
+
+**Suggested fix.** Persist unsaved buffers across a restart, or refuse to exit
+while dirty buffers exist and say how many. Anything beats silence: one line
+saying "3 buffers with unsaved changes discarded" would have turned a
+reconstruction into a save.
+
+**Recovery, for the record.** The agent re-proposed all three lost changes from
+its sandbox copies, re-anchoring each by reading the current buffer first; all
+landed in one pass. That works only when the agent kept a copy — nothing in the
+editor offered one, and the change-set records from before the restart were gone
+with the buffers.
+

@@ -108,6 +108,16 @@ module Json
   sig { params(path: String, name: String).returns(T.nilable(String)) }
   def self.py_constant(path, name) = raise(NotImplementedError, "no Ruby stand-in")
 
+  # The text of a whole file on disk; nil when it cannot be read. Tries the path
+  # as given and then from up to four parent directories, exactly as py_constant
+  # does, because a setting holds a path relative to the server's own working
+  # directory. This is how our own Python module reaches Blender: as a real file
+  # in the repository, read here and sent once per content hash by run_module.
+  rust "{ let mut out: Option<String> = None; let mut prefix = String::new(); for _ in 0..4 { let cand = format!(\"{}{}\", prefix, path); if let Ok(s) = std::fs::read_to_string(&cand) { out = Some(s); break; } prefix.push_str(\"../\"); } out }"
+  no_reference "reads the host filesystem; the reference run has no file to point at"
+  sig { params(path: String).returns(T.nilable(String)) }
+  def self.read_text(path) = raise(NotImplementedError, "no Ruby stand-in")
+
   # Parse a JSON text into a Value; nil when it is not JSON.
   rust "serde_json::from_str::<serde_json::Value>(text).ok()"
   no_reference "serde_json is the parser"

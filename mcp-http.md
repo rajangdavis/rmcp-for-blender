@@ -64,6 +64,53 @@ invocation is fine — sessions are cheap, and it survives a server restart.
   a script had *no effect* until Blender restarted. `run_script` now names the
   module `_mcp_scripts_<NAME>_<hash of the script text>`, so a changed script
   installs fresh on the next call — no rebuild and no restart.
+## What needs a save, and what does not
+
+- **Save then rebuild**: `blender.rmcp.rb`, `bindings/*.rb` — the compiler reads
+  them from disk.
+- **Save, but no rebuild**: `python/mcp_scripts.py` and `mcp_extras.py`. The
+  *server* reads both from disk on every call, so a saved edit applies at once and
+  nothing recompiles.
+- **No save needed**: `execute_code` payloads. The agent reads the file out of the
+  editor's **buffer** (`raj ctl read --json F | jq -r .text`) and ships the text
+  in the request, so an unsaved edit can be run immediately.
+- **Cache-busting**: Blender caches an installed script by module name, so editing
+  a script had *no effect* until Blender restarted. `run_script` and `run_module`
+  name the module after a hash of its text, so a changed script installs fresh on
+  the next call — no rebuild and no restart.
+- **Linting**: `dev.sh` watches the Python too and, on a change, runs `ast.parse`
+  over both files with the first interpreter that answers — `uv run --no-project
+  python`, then `python3`, then `python` — proving the runner at startup instead
+  of discovering it at lint time. No bpy import, no bytecode written.
+
+## How Python reaches Blender, and why the wire carries strings
+
+The addon's protocol has exactly one code-running verb: `execute_code`, whose
+parameter is source text. There is no run-this-file command and no file transfer,
+so a script *has* to travel as a string; upstream's own server ships whole script
+sources in every call, and ships its scripts twice (a copy inside the addon, a
+copy inside the server package) in order to do it.
+
+Two mechanisms use that one channel:
+
+- `run_script(host, port, path, NAME, args)` lifts a `NAME = r'''…'''` constant
+  out of a Python file with `Json.py_constant` and runs its body as `_main()`,
+  with the arguments in a module-global `ARGS`. Used for the addon's own
+  `blender_scripts.py` (`SCENE_SUMMARY`, `LOOK`, `BOUNDS`) and for the three
+  `mcp_extras.py` text-vision scripts, because those are upstream's format or
+  already written in it.
+- `run_module(host, port, path, entry, args)` reads the whole file with
+  `Json.read_text` and calls `entry(args)` in it as a real module. Used for
+  `python/mcp_scripts.py`, which holds the six scene and output tools. `compile()`
+  is handed the file's own path, so a traceback names a line in that file instead
+  of a generated string, and the file can be linted, imported and run alone:
+  `blender --background --python python/mcp_scripts.py -- reveal '{}'`.
+
+Both install into `sys.modules` under a hash of the text and answer
+`__MCP_NEED_INSTALL__` when Blender has not seen that text before, so the first
+call in a session pays one extra round trip and every later call sends a few
+hundred bytes. The rule for new tools: prefer `run_module`, and write real Python
+that returns a dict with `"report"`.
 
 ## The dev loop
 

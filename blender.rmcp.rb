@@ -34,6 +34,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   setting :blender_scripts, env: "BLENDER_SCRIPTS", default: "vendor/mcp-for-blender/src/blender_mcp/blender_scripts.py", description: "path to the addon's blender_scripts.py, whose scripts this server runs inside Blender"
   setting :mcp_token, env: "MCP_TOKEN", secret: true, description: "bearer token every request to the HTTP transport must carry; required, so every run needs MCP_TOKEN set"
   setting :blender_extras, env: "BLENDER_EXTRAS", default: "mcp_extras.py", description: "path to mcp_extras.py, whose WIREFRAME and MESH_REPORT scripts this server runs inside Blender"
+  setting :blender_python, env: "BLENDER_PYTHON", default: "python/mcp_scripts.py", description: "path to the Python module the scene and output tools run: a real module, read here and installed into Blender once per content hash"
 
   # One command over the bridge: send, check the addon's status, and return the
   # result as JSON text (helpers cannot carry an opaque Json::Value).
@@ -68,6 +69,38 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     # A cold Blender has not seen this script yet: installing it and running it
     # in one more command costs a round trip once, and every later call sends
     # only the short invocation above.
+    retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable; start the addon's server in Blender")) else resp end
+    retry_status = if cold then (Json.text(retry_resp, "/status") || "error") else status end
+    retry_stdout = if cold then (Json.text(retry_resp, "/result/result") || "") else stdout end
+    raise (Json.text(retry_resp, "/message") || "Blender returned an error") unless retry_status == "success"
+    retry_stdout.split("__MCP_RESULT__").last || raise("the script finished without a result")
+  end
+
+  # Run one entry point in our own Python module: a real file in the repository,
+  # read here and installed into Blender's sys.modules under a hash of its text.
+  # A changed file installs once under a new module name and every later call
+  # sends only the short invocation, so the wire cost is a few hundred bytes per
+  # call. compile() is handed the file's own path, so a traceback out of Blender
+  # names a line in that file instead of a generated string. Each entry point
+  # takes the tool's arguments as a dict and returns a dict whose "report" is the
+  # text. Upstream's own blender_scripts.py constants keep using run_script.
+  helper :run_module, args: [:string, :i64, :string, :string, :string], returns: :string do |host, port, path, entry, arguments|
+    module_source = Json.read_text(path) || raise("#{path} not found: the Python module these tools run lives there")
+    qargs = Json.quote(arguments)
+    qentry = Json.quote(entry)
+    qpath = Json.quote(path)
+    qmodule = Json.quote("_mcp_module_#{Json.short_hash(module_source)}")
+    qsource = Json.quote(module_source)
+    call = "print('__MCP_RESULT__' + _json.dumps(getattr(mod, #{qentry})(_json.loads(#{qargs}))))"
+    invoke = "import sys, json as _json\nmod = sys.modules.get(#{qmodule})\nif mod is None:\n    print('__MCP_NEED_INSTALL__')\nelse:\n    #{call}\n"
+    install = "import sys, types, json as _json\nmod = sys.modules.get(#{qmodule})\nif mod is None:\n    mod = types.ModuleType(#{qmodule})\n    mod.__file__ = #{qpath}\n    exec(compile(#{qsource}, #{qpath}, 'exec'), mod.__dict__)\n    sys.modules[#{qmodule}] = mod\n#{call}\n"
+    invoke_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(invoke)}}}"
+    install_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(install)}}}"
+    raw = Json.parse(rust(:blender_call, host, port, invoke_request))
+    resp = raw || raise("Blender bridge unreachable; start the addon's server in Blender")
+    status = Json.text(resp, "/status") || "error"
+    stdout = Json.text(resp, "/result/result") || ""
+    cold = if rust(:trim_text, stdout) == "__MCP_NEED_INSTALL__" then true else false end
     retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable; start the addon's server in Blender")) else resp end
     retry_status = if cold then (Json.text(retry_resp, "/status") || "error") else status end
     retry_stdout = if cold then (Json.text(retry_resp, "/result/result") || "") else stdout end
@@ -294,8 +327,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
         type0 = if file_count > 0 then (Json.text(parsed, "/Response/ResultFile3Ds/0/Type") || "").upcase else "" end
         url1 = if file_count > 1 then Json.text(parsed, "/Response/ResultFile3Ds/1/Url") || "" else "" end
         type1 = if file_count > 1 then (Json.text(parsed, "/Response/ResultFile3Ds/1/Type") || "").upcase else "" end
-        glb = if type0 == "GLB" then url0 elsif type1 == "GLB" then url1 else "" end
-        model = if glb != "" then glb elsif url0 != "" then url0 else url1 end
+        model = if type0 == "GLB" then url0 elsif type1 == "GLB" then url1 elsif url0 != "" then url0 else url1 end
         if model == ""
           "{\"state\":\"failed\",\"detail\":\"finished without a model file\"}"
         else
@@ -531,6 +563,170 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
       args = "{\"source\":#{Json.quote(source)},\"width\":#{width}}"
       data = Json.parse(run_script(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_extras), "IMAGE_REPORT", args)) || raise("could not parse the image report")
       result(:TextReport, report: Json.text(data, "/report") || raise("the image script returned no text"))
+    end
+  end
+
+  # --- Scene and output: seeing, making, placing, colouring, rendering, exporting ---
+  #
+  # These run python/mcp_scripts.py through run_module: a real module in the
+  # repository, read here and installed into Blender once per content hash, so a
+  # change to it needs no rebuild and a traceback names a line in the file.
+
+  params :RevealParams do
+    field :name, :string, description: "Exact name of the object to reveal and frame; unset reports the view instead", optional: true
+    field :frame, :bool, description: "Frame the object in every 3D viewport", default: true
+  end
+
+  tool :reveal, params: :RevealParams, title: "Reveal an object",
+       description: "Say why an object is not on screen and clear what is hiding it: leave local view, leave camera view, unhide the object and its collections, select it and frame it. The report names the file, scene, view layer, window and viewport count, which is also the answer to which Blender, and which file, a change landed in. Run it before believing a screenshot.",
+       output: :TextReport, read_only: true, open_world: true do
+    body do |name, frame|
+      wanted = name || ""
+      args = "{\"name\":#{Json.quote(wanted)},\"frame\":#{frame}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "reveal", args)) || raise("could not parse the reveal report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("reveal returned no text"))
+    end
+  end
+
+  params :TextParams do
+    field :text, :string, description: "The characters to draw; a newline starts another line"
+    field :name, :string, description: "Object name; unset derives it from the first line", optional: true
+    field :size, :f64, description: "Cap height in metres", default: 1.0, min: 0.01
+    field :extrude, :f64, description: "Depth in metres; 0 stays flat", default: 0.0, min: 0.0
+    field :spacing, :f64, description: "Letter spacing; 1 is Blender's own default", optional: true, min: 0.01
+    field :align, :string, description: "How the lines line up around the origin", enum: ["LEFT", "CENTER", "RIGHT", "JUSTIFY", "FLUSH"], default: "CENTER"
+    field :x, :f64, description: "Location X in metres", default: 0.0
+    field :y, :f64, description: "Location Y in metres", default: 0.0
+    field :z, :f64, description: "Location Z in metres", default: 0.0
+    field :as_mesh, :bool, description: "Convert it to a mesh, so wireframe, mesh_report and export can read it", default: true
+  end
+
+  tool :text, params: :TextParams, title: "Make 3D text",
+       description: "Create one text object from a string, and convert it to a mesh unless as_mesh is false. Text is a curve in Blender, so a mesh is what wireframe, mesh_report and an export can actually read; keep the curve when the text has to stay editable. Colour it with material, position it with place.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |text, name, size, extrude, spacing, align, x, y, z, as_mesh|
+      wanted = name || ""
+      spacing_json = if spacing.nil? then "null" else spacing.to_s end
+      args = "{\"text\":#{Json.quote(text)},\"name\":#{Json.quote(wanted)},\"size\":#{size},\"extrude\":#{extrude},\"spacing\":#{spacing_json},\"align\":#{Json.quote(align)},\"x\":#{x},\"y\":#{y},\"z\":#{z},\"as_mesh\":#{as_mesh}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "text", args)) || raise("could not parse the text report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("the text script returned no text"))
+    end
+  end
+
+  params :PlaceParams do
+    field :name, :string, description: "Exact name of the object to move"
+    field :x, :f64, description: "X in metres; unset leaves X alone", optional: true
+    field :y, :f64, description: "Y in metres; unset leaves Y alone", optional: true
+    field :z, :f64, description: "Z in metres; unset leaves Z alone", optional: true
+    field :rx, :f64, description: "Rotation about X in degrees; unset leaves it alone", optional: true
+    field :ry, :f64, description: "Rotation about Y in degrees; unset leaves it alone", optional: true
+    field :rz, :f64, description: "Rotation about Z in degrees; unset leaves it alone", optional: true
+    field :scale, :f64, description: "Uniform scale; unset leaves the scale alone", optional: true, min: 0.0
+    field :relative, :bool, description: "Add to the current values instead of replacing them", default: false
+  end
+
+  tool :place, params: :PlaceParams, title: "Move an object",
+       description: "Set an object's location, rotation or uniform scale: absolute by default, added to the current values when relative is set. Only the axes given are touched, so an unset axis keeps its value instead of being zeroed, which is what makes a relative nudge usable. The report gives what changed, the dimensions afterwards, whether a parent makes these numbers local, and any constraint that could override the result.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |name, x, y, z, rx, ry, rz, scale, relative|
+      qx = if x.nil? then "null" else x.to_s end
+      qy = if y.nil? then "null" else y.to_s end
+      qz = if z.nil? then "null" else z.to_s end
+      qrx = if rx.nil? then "null" else rx.to_s end
+      qry = if ry.nil? then "null" else ry.to_s end
+      qrz = if rz.nil? then "null" else rz.to_s end
+      qscale = if scale.nil? then "null" else scale.to_s end
+      args = "{\"name\":#{Json.quote(name)},\"x\":#{qx},\"y\":#{qy},\"z\":#{qz},\"rx\":#{qrx},\"ry\":#{qry},\"rz\":#{qrz},\"scale\":#{qscale},\"relative\":#{relative}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "place", args)) || raise("could not parse the placement report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("place returned no text"))
+    end
+  end
+
+  params :MaterialParams do
+    field :name, :string, description: "Exact name of the object whose material to set"
+    field :colour, :string, description: "A colour to set: a hex value (#rrggbb or #rgb) or a name such as red, wood or steel", optional: true
+    field :material, :string, description: "Name an existing material to assign instead of a colour", optional: true
+    field :roughness, :f64, description: "Principled roughness 0-1; unset leaves it", optional: true, min: 0.0, max: 1.0
+    field :metallic, :f64, description: "Principled metallic 0-1; unset leaves it", optional: true, min: 0.0, max: 1.0
+  end
+
+  tool :material, params: :MaterialParams, title: "Colour an object",
+       description: "Set or create the material on an object, from a hex colour or a name: it uses the object's existing material when it has one and otherwise makes one. Both the Principled base colour a render uses and the flat viewport colour a solid screenshot shows are set, and the report says which slot the faces actually use, so a colour that cannot show up says so instead of looking applied. Call it with no colour to read what an object has.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |name, colour, material, roughness, metallic|
+      wanted_colour = colour || ""
+      wanted_material = material || ""
+      qrough = if roughness.nil? then "null" else roughness.to_s end
+      qmetal = if metallic.nil? then "null" else metallic.to_s end
+      args = "{\"name\":#{Json.quote(name)},\"colour\":#{Json.quote(wanted_colour)},\"material\":#{Json.quote(wanted_material)},\"roughness\":#{qrough},\"metallic\":#{qmetal}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "material", args)) || raise("could not parse the material report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("material returned no text"))
+    end
+  end
+
+  params :RemoveParams do
+    field :names, :string_list, description: "Exact names of the objects to remove"
+    field :purge, :bool, description: "After removing, purge data left with no user: meshes, materials, images", default: true
+  end
+
+  tool :remove, params: :RemoveParams, title: "Remove objects",
+       description: "Delete named objects from the scene and report the cost: what went, which of their children were left unparented, what the orphan purge freed, and what is left. The counterpart of text, place and import_asset. Blender's own undo may not cover it, so treat a removal as final.",
+       output: :TextReport, destructive: true, open_world: true do
+    body do |names, purge|
+      listed = Json.str_list_json(names)
+      args = "{\"names\":#{listed},\"purge\":#{purge}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "remove", args)) || raise("could not parse the removal report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("remove returned no text"))
+    end
+  end
+
+  output :FileReport do
+    field :path, :string, description: "Absolute path of the file that was written"
+    field :report, :string, description: "Plain text: what was written and with what settings"
+  end
+
+  params :RenderParams do
+    field :file, :string, description: "Where to write the PNG; unset writes <name>-render.png beside the .blend, or on the Desktop for an unsaved file", optional: true
+    field :camera, :string, description: "Camera to render from; unset uses the scene camera", optional: true
+    field :width, :i32, description: "Pixels across; unset keeps the file's setting", optional: true, min: 16, max: 8192
+    field :height, :i32, description: "Pixels down; unset keeps the file's setting", optional: true, min: 16, max: 8192
+    field :samples, :i32, description: "Samples for the current engine; unset keeps the file's setting", optional: true, min: 1, max: 8192
+    field :frame, :i32, description: "Frame to render; unset renders the current one", optional: true
+  end
+
+  tool :render, params: :RenderParams, title: "Render to a file",
+       description: "Render the scene to a PNG at the resolution and sample count asked for and leave it on disk, so the result is a file the user keeps and can open. The report names the path, the size and the settings; read the picture back as text with image_report, or use look with mode camera when the picture should come back as an image in the reply.",
+       output: :FileReport, destructive: true, open_world: true do
+    body do |file, camera, width, height, samples, frame|
+      wanted_file = file || ""
+      wanted_camera = camera || ""
+      qwidth = if width.nil? then "null" else width.to_s end
+      qheight = if height.nil? then "null" else height.to_s end
+      qsamples = if samples.nil? then "null" else samples.to_s end
+      qframe = if frame.nil? then "null" else frame.to_s end
+      args = "{\"file\":#{Json.quote(wanted_file)},\"camera\":#{Json.quote(wanted_camera)},\"width\":#{qwidth},\"height\":#{qheight},\"samples\":#{qsamples},\"frame\":#{qframe}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "render", args)) || raise("could not parse the render report")
+      result(:FileReport, path: Json.text(data, "/path") || "", report: Json.text(data, "/report") || raise("the render script returned no text"))
+    end
+  end
+
+  params :ExportParams do
+    field :file, :string, description: "Where to write the model; unset writes <name>.glb (or .fbx) beside the .blend", optional: true
+    field :format, :string, description: "glb carries materials and animation; fbx is the fallback for importers that need it", enum: ["glb", "fbx"], default: "glb"
+    field :objects, :string_list, description: "Objects to export, children included; unset exports everything visible", optional: true
+    field :selection_only, :bool, description: "Export the viewport selection instead", default: false
+    field :apply_modifiers, :bool, description: "Apply modifiers on the way out", default: true
+  end
+
+  tool :export, params: :ExportParams, title: "Export the scene",
+       description: "Write the scene, or named objects with their children, to glTF (.glb) or FBX, so the work leaves Blender as one file. The report names the path, the size, and anything skipped because it is not in the current view layer. It replaces the viewport selection as a side effect, which the report says, so call reveal afterwards if the selection mattered.",
+       output: :FileReport, destructive: true, open_world: true do
+    body do |file, format, objects, selection_only, apply_modifiers|
+      wanted_file = file || ""
+      listed = Json.str_list_json(objects || [])
+      args = "{\"file\":#{Json.quote(wanted_file)},\"format\":#{Json.quote(format)},\"objects\":#{listed},\"selection_only\":#{selection_only},\"apply_modifiers\":#{apply_modifiers}}"
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "export", args)) || raise("could not parse the export report")
+      result(:FileReport, path: Json.text(data, "/path") || "", report: Json.text(data, "/report") || raise("the export script returned no text"))
     end
   end
 
