@@ -8,3 +8,15 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# third-party tree: only the file the server reads at runtime, plus the addon
+# whose command names and kwargs our tools encode
+vendor/*
+!vendor/mcp-for-blender/
+vendor/mcp-for-blender/*
+!vendor/mcp-for-blender/addon.py
+!vendor/mcp-for-blender/src/
+vendor/mcp-for-blender/src/*
+!vendor/mcp-for-blender/src/blender_mcp/
+vendor/mcp-for-blender/src/blender_mcp/*
+!vendor/mcp-for-blender/src/blender_mcp/blender_scripts.py
