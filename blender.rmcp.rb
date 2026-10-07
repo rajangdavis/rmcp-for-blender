@@ -11,8 +11,23 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   # source, captured stdout, user-supplied names), and calling Rust's own trim
   # keeps the generated code idiomatic: every Ruby .strip otherwise compiles to an
   # explicit-set trim and earns a W-STR-STRIP-RUBY warning.
-  rust_item "fn trim_text(text: impl AsRef<str>) -> String { text.as_ref().trim().to_string() }"
-  rust_fn :trim_text, args: [:string], returns: :string
+  #
+  # The generation helpers below need three things the DSL cannot express itself:
+  # a sleep between poll attempts (the DSL has no sleep, and the poll loop must
+  # not spin), an image read as base64 and an extension for Hyper3D Rodin's
+  # main-site request (it takes the bytes rather than a path), and Rust's trim
+  # for the shared script installer. They live in blender_gen.rs beside the
+  # bridge and are declared with rust_fn from: :blender_gen, so rustc checks
+  # them as a file rather than as an inline string, and every Ruby .strip stays
+  # warning-free. sleep_ms is async: a body that calls it (gen_wait) is compiled
+  # async too, and the tool bodies that reach it (generate_3d, make_3d) await the
+  # whole chain; the DSL infers that from the call, so no helper declares async.
+  # base64 is already a binding crate, so blender_gen.rs may use it too.
+  rust_file "blender_gen.rs", as: :blender_gen
+  rust_fn :sleep_ms, args: [:i64], returns: :i64, async: true, from: :blender_gen
+  rust_fn :gen_file_base64, args: [:string], returns: :string, from: :blender_gen
+  rust_fn :gen_path_suffix, args: [:string], returns: :string, from: :blender_gen
+  rust_fn :trim_text, args: [:string], returns: :string, from: :blender_gen
 
   setting :blender_host, env: "BLENDER_HOST", default: "localhost", description: "host of the Blender addon bridge"
   setting :blender_port, env: "BLENDER_PORT", default: "9876", description: "port of the Blender addon bridge"
@@ -81,6 +96,346 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     problem = Json.text(info, "/error") || ""
     raise problem unless problem == ""
     Json.dump(info) || raise("could not encode the look result")
+  end
+
+  # --- 3D generation: text or image to one imported, textured object ---
+  #
+  # generate_3d and make_3d share this layer. The addon's generators (Tripo,
+  # Hunyuan3D, Hyper3D Rodin) each have their own submit, poll and import
+  # commands; the helpers below choose one, submit, poll with the async sleep
+  # until the wait budget runs out, then import and report the model's world
+  # bounding box and how to place it. A poll that outlives the budget returns
+  # a resumable handle instead of losing the paid generation. Every
+  # handler-level failure arrives as status: "success" with an {"error": ...}
+  # result, so gen_problem checks for that rather than trusting the bridge's
+  # status, and a reply that is not JSON at all is reported as unparseable.
+  helper :gen_default_name, args: [:string], returns: :string do |prompt|
+    cleaned = prompt.gsub(/[^A-Za-z0-9]/, " ")
+    word = cleaned.split.first || ""
+    if word == ""
+      "Generated"
+    else
+      initial = (word[0, 1] || "").upcase
+      tail = word[1, word.length - 1] || ""
+      "#{initial}#{tail}"
+    end
+  end
+
+  # A generator's status command returns {"enabled": ...}. gen_status reads
+  # that flag as a bool, and gen_choose turns a false into the message that
+  # names what to switch on in Blender's sidebar.
+  helper :gen_status, args: [:string, :i64, :string], returns: :bool do |host, port, command|
+    request = "{\"type\":\"#{command}\",\"params\":{}}"
+    parsed = Json.parse(blender_request(host, port, request)) || raise("could not parse #{command}")
+    enabled = Json.at(parsed, "/enabled") || raise("the #{command} reply has no enabled flag")
+    flag = Json.dump(enabled) || raise("could not encode #{command}")
+    flag == "true"
+  end
+
+  # Resolve the requested provider to one that is actually enabled: auto
+  # prefers Tripo, then Hunyuan3D, then Hyper3D Rodin, and any other name must
+  helper :gen_choose, args: [:string, :i64, :string], returns: :string do |host, port, requested|
+    want = requested.downcase
+    if want == "auto"
+      tripo = gen_status(host, port, "get_tripo_status")
+      hunyuan = gen_status(host, port, "get_hunyuan3d_status")
+      hyper = gen_status(host, port, "get_hyper3d_status")
+      if tripo then "tripo" elsif hunyuan then "hunyuan3d" elsif hyper then "hyper3d" else raise("No 3D generator is enabled. In Blender's MCP for Blender sidebar (press N in the 3D Viewport), turn on Hunyuan3D or Hyper3D Rodin with an API key, or use MCP for Blender Premium (no keys needed): https://mcp-for-blender.com/premium") end
+    elsif want == "tripo"
+      gen_status(host, port, "get_tripo_status") ? "tripo" : raise("Tripo is only available with MCP for Blender Premium. If Premium is on, update the Blender addon: run `uvx mcp-for-blender install-addon`, then restart Blender.")
+    elsif want == "hunyuan3d"
+      gen_status(host, port, "get_hunyuan3d_status") ? "hunyuan3d" : raise("Hunyuan3D is not enabled. Turn it on and add an API key (or point it at a local server) in the MCP for Blender sidebar in Blender (press N in the 3D Viewport), then restart the connection.")
+    elsif want == "hyper3d"
+      gen_status(host, port, "get_hyper3d_status") ? "hyper3d" : raise("Hyper3D Rodin is not enabled. Turn it on and add an API key in the MCP for Blender sidebar in Blender (press N in the 3D Viewport), then restart the connection.")
+    else
+      raise("Unknown provider '#{requested}'. Use one of: auto, hyper3d, hunyuan3d, tripo")
+    end
+  end
+
+  # The addon's handlers answer status: "success" even when the command
+  # failed; the failure is an {"error": ...} (or a code/message pair) inside
+  # the result. gen_problem pulls that out and returns "" when there is none.
+  helper :gen_problem, args: [:string], returns: :string do |text|
+    parsed = Json.parse(text) || raise("the Blender addon returned an unparseable reply: #{text}")
+    as_text = Json.text(parsed, "") || ""
+    as_error = Json.text(parsed, "/error") || ""
+    as_code = Json.text(parsed, "/code") || ""
+    as_message = Json.text(parsed, "/message") || ""
+    if as_text != "" && as_text.downcase.start_with?("error")
+      as_text
+    elsif as_code != ""
+      if as_message != "" then "#{as_message} (code #{as_code}; tell the user as written and don't retry automatically)" else "#{as_code} (tell the user as written and don't retry automatically)" end
+    else
+      as_error
+    end
+  end
+
+  # One raw addon command with a ready-made params object, through the shared
+  # bridge helper, so the generation commands all take the same path.
+  helper :gen_raw, args: [:string, :i64, :string, :string], returns: :string do |host, port, command, params|
+    request = "{\"type\":\"#{command}\",\"params\":#{params}}"
+    blender_request(host, port, request)
+  end
+
+  # Submit one job to the chosen provider and return a small JSON reply with
+  # either {"status":"job","handle":...} or a finished local Hunyuan3D
+  # {"status":"done",...}; a submit failure raises the handler's own message.
+  helper :gen_submit, args: [:string, :i64, :string, :string, :string, :string, :string], returns: :string do |host, port, provider, prompt, image, quality, bbox_json|
+    if provider == "tripo"
+      quality_field = if quality == "" then "" else ",\"quality\":#{Json.quote(quality)}" end
+      params = "{\"text_prompt\":#{Json.quote(prompt)},\"image\":#{Json.quote(image)}#{quality_field}}"
+      raw = gen_raw(host, port, "create_tripo_job", params)
+      problem = gen_problem(raw)
+      raise problem unless problem == ""
+      parsed = Json.parse(raw) || raise("could not parse the Tripo reply: #{raw}")
+      request_id = Json.text(parsed, "/request_id") || ""
+      raise "Tripo returned no request id: #{raw}" if request_id == ""
+      "{\"status\":\"job\",\"handle\":\"tripo:rid:#{request_id}\"}"
+    elsif provider == "hunyuan3d"
+      quality_field = if quality == "" then "" else ",\"quality\":#{Json.quote(quality)}" end
+      params = "{\"text_prompt\":#{Json.quote(prompt)},\"image\":#{Json.quote(image)}#{quality_field}}"
+      raw = gen_raw(host, port, "create_hunyuan_job", params)
+      problem = gen_problem(raw)
+      raise problem unless problem == ""
+      parsed = Json.parse(raw) || raise("could not parse the Hunyuan3D reply: #{raw}")
+      nested_message = Json.text(parsed, "/Response/Error/Message") || ""
+      nested_plain = Json.text(parsed, "/Response/Error") || ""
+      nested_error = if nested_message != "" then nested_message else nested_plain end
+      raise nested_error unless nested_error == ""
+      job_id = Json.text(parsed, "/Response/JobId") || ""
+      status = Json.text(parsed, "/status") || ""
+      if job_id != ""
+        "{\"status\":\"job\",\"handle\":\"hunyuan3d:job:job_#{job_id}\"}"
+      elsif status == "DONE"
+        "{\"status\":\"done\",\"message\":\"Generated and imported by the local Hunyuan3D server. Find it with get_scene_info.\"}"
+      else
+        raise("Hunyuan3D returned no job: #{raw}")
+      end
+    else
+      images = if image == ""
+        "null"
+      elsif image.start_with?("http://") || image.start_with?("https://")
+        "[#{Json.quote(image)}]"
+      else
+        data = rust(:gen_file_base64, image)
+        raise "Image not found: #{image}. Give an absolute image file path or an http(s) URL, or use a prompt instead." if data == ""
+        "[[#{Json.quote(rust(:gen_path_suffix, image))},#{Json.quote(data)}]]"
+      end
+      rodin_prompt = if image == "" then Json.quote(prompt) else "null" end
+      params = "{\"text_prompt\":#{rodin_prompt},\"images\":#{images},\"bbox_condition\":#{bbox_json}}"
+      raw = gen_raw(host, port, "create_rodin_job", params)
+      problem = gen_problem(raw)
+      raise problem unless problem == ""
+      parsed = Json.parse(raw) || raise("could not parse the Hyper3D reply: #{raw}")
+      uuid = Json.text(parsed, "/uuid") || ""
+      subscription = Json.text(parsed, "/jobs/subscription_key") || ""
+      request_id = Json.text(parsed, "/request_id") || ""
+      if uuid != "" && subscription != ""
+        "{\"status\":\"job\",\"handle\":\"hyper3d:main:#{uuid}|#{subscription}\"}"
+      elsif request_id != ""
+        "{\"status\":\"job\",\"handle\":\"hyper3d:fal:#{request_id}\"}"
+      else
+        raise("Hyper3D Rodin returned no job: #{raw}")
+      end
+    end
+  end
+
+  # One poll: ask the provider for the job's state and return a small JSON
+  # object with a state of running, done or failed. The detail carries the
+  helper :gen_poll, args: [:string, :i64, :string, :string, :string, :string], returns: :string do |host, port, provider, kind, ident, hint|
+    if provider == "tripo" || (provider == "hyper3d" && kind == "fal")
+      command = if provider == "tripo" then "poll_tripo_job_status" else "poll_rodin_job_status" end
+      raw = gen_raw(host, port, command, "{\"request_id\":#{Json.quote(ident)}}")
+      parsed = Json.parse(raw) || raise("could not parse the status reply: #{raw}")
+      status = (Json.text(parsed, "/status") || "").upcase
+      if status == "COMPLETED"
+        problem = gen_problem(raw)
+        raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
+        "{\"state\":\"done\",\"detail\":\"\"}"
+      elsif status != "" && status != "IN_QUEUE" && status != "IN_PROGRESS"
+        detail = Json.text(parsed, "/error") || status
+        "{\"state\":\"failed\",\"detail\":#{Json.quote(detail)}}"
+      else
+        problem = gen_problem(raw)
+        raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
+        detail = if status == "" then "IN_QUEUE" else status end
+        "{\"state\":\"running\",\"detail\":#{Json.quote(detail)}}"
+      end
+    elsif provider == "hyper3d"
+      subscription = ident.split("|").last || ident
+      raw = gen_raw(host, port, "poll_rodin_job_status", "{\"subscription_key\":#{Json.quote(subscription)}}")
+      problem = gen_problem(raw)
+      raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
+      parsed = Json.parse(raw) || raise("could not parse the Rodin status reply: #{raw}")
+      statuses = Json.text_list(parsed, "/status_list") || []
+      joined = statuses.join(", ")
+      done = statuses.length > 0 && joined.gsub("Done", "").gsub(",", "").gsub(" ", "") == ""
+      failed = joined.include?("Failed") || joined.include?("Canceled")
+      detail = if statuses.length == 0 then "Waiting" else joined end
+      if done
+        "{\"state\":\"done\",\"detail\":\"\"}"
+      elsif failed
+        "{\"state\":\"failed\",\"detail\":#{Json.quote(detail)}}"
+      else
+        "{\"state\":\"running\",\"detail\":#{Json.quote(detail)}}"
+      end
+    else
+      raw = gen_raw(host, port, "poll_hunyuan_job_status", "{\"job_id\":#{Json.quote(ident)}}")
+      problem = gen_problem(raw)
+      raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
+      parsed = Json.parse(raw) || raise("could not parse the Hunyuan3D status reply: #{raw}")
+      status = Json.text(parsed, "/Response/Status") || ""
+      poll_message = Json.text(parsed, "/Response/ErrorMessage") || ""
+      poll_plain = Json.text(parsed, "/Response/Error") || ""
+      nested_error = if poll_message != "" then poll_message else poll_plain end
+      if status == "DONE"
+        file_count = Json.count(parsed, "/Response/ResultFile3Ds") || 0
+        url0 = if file_count > 0 then Json.text(parsed, "/Response/ResultFile3Ds/0/Url") || "" else "" end
+        type0 = if file_count > 0 then (Json.text(parsed, "/Response/ResultFile3Ds/0/Type") || "").upcase else "" end
+        url1 = if file_count > 1 then Json.text(parsed, "/Response/ResultFile3Ds/1/Url") || "" else "" end
+        type1 = if file_count > 1 then (Json.text(parsed, "/Response/ResultFile3Ds/1/Type") || "").upcase else "" end
+        glb = if type0 == "GLB" then url0 elsif type1 == "GLB" then url1 else "" end
+        model = if glb != "" then glb elsif url0 != "" then url0 else url1 end
+        if model == ""
+          "{\"state\":\"failed\",\"detail\":\"finished without a model file\"}"
+        else
+          "{\"state\":\"done\",\"detail\":#{Json.quote(model)}}"
+        end
+      elsif status == "FAIL" || nested_error != ""
+        detail = if nested_error != "" then nested_error else "generation failed" end
+        "{\"state\":\"failed\",\"detail\":#{Json.quote(detail)}}"
+      else
+        detail = if status == "" then "WAIT" else status end
+        "{\"state\":\"running\",\"detail\":#{Json.quote(detail)}}"
+      end
+    end
+  end
+
+  # Import a finished job and return "" on success or a reason on failure;
+  helper :gen_import, args: [:string, :i64, :string, :string, :string, :string, :string, :string], returns: :string do |host, port, provider, kind, ident, name, detail, hint|
+    raw = if provider == "tripo"
+      gen_raw(host, port, "import_generated_asset_tripo", "{\"request_id\":#{Json.quote(ident)},\"name\":#{Json.quote(name)}}")
+    elsif provider == "hyper3d" && kind == "fal"
+      gen_raw(host, port, "import_generated_asset", "{\"request_id\":#{Json.quote(ident)},\"name\":#{Json.quote(name)}}")
+    elsif provider == "hyper3d"
+      task_uuid = ident.split("|").first || ident
+      gen_raw(host, port, "import_generated_asset", "{\"task_uuid\":#{Json.quote(task_uuid)},\"name\":#{Json.quote(name)}}")
+    else
+      gen_raw(host, port, "import_generated_asset_hunyuan", "{\"name\":#{Json.quote(name)},\"zip_file_url\":#{Json.quote(detail)}}")
+    end
+    problem = gen_problem(raw)
+    raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
+    parsed = Json.parse(raw) || raise("could not parse the import reply: #{raw}")
+    succeed = if Json.has?(parsed, "/succeed") then Json.dump(Json.at(parsed, "/succeed") || raise("could not read the import flag")) || "true" else "true" end
+    if succeed == "false"
+      reason_error = Json.text(parsed, "/error") || ""
+      reason_message = Json.text(parsed, "/message") || ""
+      reason = if reason_error != "" then reason_error elsif reason_message != "" then reason_message else "the addon reported no imported object" end
+      raise("#{reason}. The generation may have finished but the import failed. #{hint}")
+    else
+      ""
+    end
+  end
+
+  # The success reply: "Generated and imported ...", then the imported
+  # object's world_bounding_box and size from the addon's BOUNDS script, plus
+  # the placement guidance, so the model can be sized and grounded.
+  helper :gen_success, args: [:string, :i64, :string, :string, :string], returns: :string do |host, port, scripts, name, provider|
+    reply = "Generated and imported '#{name}' with #{provider}."
+    arguments = "{\"names\":[#{Json.quote(name)}]}"
+    bounds = Json.parse(run_script(host, port, scripts, "BOUNDS", arguments)) || raise("could not read the bounding box")
+    count = Json.count(bounds, "") || 0
+    if count == 0
+      reply
+    else
+      b_name = Json.text(bounds, "/0/name") || name
+      lo0 = Json.f64(bounds, "/0/world_bounding_box/0/0") || 0.0
+      lo1 = Json.f64(bounds, "/0/world_bounding_box/0/1") || 0.0
+      lo2 = Json.f64(bounds, "/0/world_bounding_box/0/2") || 0.0
+      hi0 = Json.f64(bounds, "/0/world_bounding_box/1/0") || 0.0
+      hi1 = Json.f64(bounds, "/0/world_bounding_box/1/1") || 0.0
+      hi2 = Json.f64(bounds, "/0/world_bounding_box/1/2") || 0.0
+      s0 = Json.f64(bounds, "/0/size/0") || 0.0
+      s1 = Json.f64(bounds, "/0/size/1") || 0.0
+      s2 = Json.f64(bounds, "/0/size/2") || 0.0
+      "#{reply} world_bounding_box min [#{lo0}, #{lo1}, #{lo2}], max [#{hi0}, #{hi1}, #{hi2}] (size #{s0} x #{s1} x #{s2} m). Generated models have arbitrary scale and facing: scale it to real size, put its lowest point on the ground, rotate it to face the right way, then look(mode=\"angles\", target=[\"#{b_name}\"])."
+    end
+  end
+
+  # Wait for a handle to finish: poll until the job is done, failed, or the
+  # budget runs out, sleeping five seconds between polls. Done imports the
+  # model and reports it; a timeout returns a reply that carries the handle
+  # so the caller can resume without starting (and paying for) a new job.
+  helper :gen_wait, args: [:string, :i64, :string, :string, :string, :i64], returns: :string do |host, port, scripts, handle, name, polls|
+    provider = handle.split(":").first || ""
+    rest = handle[provider.length + 1, handle.length] || ""
+    kind = rest.split(":").first || ""
+    ident = rest[kind.length + 1, rest.length] || ""
+    known = provider == "tripo" || provider == "hunyuan3d" || provider == "hyper3d"
+    raise "Not a generation job handle: #{handle}. It should look like provider:kind:id, as an earlier generate_3d reply returned." unless known && kind != "" && ident != ""
+    hint = "Call generate_3d(job=\"#{handle}\", name=\"#{name}\") to keep waiting; it imports the model when it's ready. Don't start a new generation."
+    polls.times.each do |i|
+      polled = gen_poll(host, port, provider, kind, ident, hint)
+      parsed = Json.parse(polled) || raise("could not parse the poll result: #{polled}")
+      state = Json.text(parsed, "/state") || "running"
+      detail = Json.text(parsed, "/detail") || ""
+      if state == "done"
+        import_failed = gen_import(host, port, provider, kind, ident, name, detail, hint)
+        if import_failed != ""
+          return "Import failed. #{hint}"
+        else
+          return gen_success(host, port, scripts, name, provider)
+        end
+      elsif state == "failed"
+        return "Generation failed: #{detail}. This attempt was not imported. Start a new generation when you are ready."
+      elsif i + 1 >= polls
+        return "Still generating (#{provider}: #{detail}). #{hint}"
+      else
+        paused = rust(:sleep_ms, 5000)
+        paused > 0
+      end
+    end
+    "Still generating (#{provider}: unknown). #{hint}"
+  end
+
+  # Hyper3D Rodin's bbox_condition is three positive proportions or absent; a
+  # three-element check here keeps the request well-formed.
+  helper :gen_bbox, args: [:i64_list], returns: :string do |bbox_condition|
+    if bbox_condition.length == 0
+      "null"
+    elsif bbox_condition.length != 3
+      raise("bbox_condition must be three positive numbers [length, width, height]")
+    elsif bbox_condition.any? { |value| value <= 0 }
+      raise("bbox_condition must be three positive numbers [length, width, height]")
+    else
+      Json.i64_list_json(bbox_condition)
+    end
+  end
+
+  # The one entry point both tools use. With a job handle it resumes; without
+  # one it checks that exactly one of prompt/image was given, chooses a
+  # provider, submits, then waits. wait_seconds is the caller's budget, capped
+  helper :gen_run, args: [:string, :i64, :string, :string, :string, :string, :string, :string, :string, :string, :i64], returns: :string do |host, port, scripts, prompt, image, name, provider, quality, bbox_json, job, wait_seconds|
+    budget = if wait_seconds > 45 then 45 else wait_seconds end
+    polls = if budget < 5 then 1 else budget / 5 end
+    if job != ""
+      resume_name = if name == "" then "Generated" else name end
+      gen_wait(host, port, scripts, job, resume_name, polls)
+    else
+      raise "give exactly one of prompt or image." if (prompt == "") == (image == "")
+      chosen = gen_choose(host, port, provider.downcase)
+      object_name = if name == "" then gen_default_name(prompt) else name end
+      submitted = gen_submit(host, port, chosen, prompt, image, quality, bbox_json)
+      parsed = Json.parse(submitted) || raise("could not parse the submit result: #{submitted}")
+      status = Json.text(parsed, "/status") || ""
+      if status == "job"
+        job_handle = Json.text(parsed, "/handle") || raise("the generation returned no job handle")
+        gen_wait(host, port, scripts, job_handle, object_name, polls)
+      else
+        message = Json.text(parsed, "/message") || "Generation finished."
+        message
+      end
+    end
   end
 
   params :SceneParams do
@@ -161,6 +516,21 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
       args = "{\"name\":#{Json.quote(name)},\"views\":#{Json.str_list_json(views || [])},\"width\":#{width},\"height\":#{height}}"
       data = Json.parse(run_script(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_extras), "WIREFRAME", args)) || raise("could not parse the wireframe result")
       result(:TextReport, report: Json.text(data, "/report") || raise("the wireframe script returned no text"))
+    end
+  end
+
+  params :ImageReportParams do
+    field :source, :string, description: "Name of an image already in the file, or a path to an image on disk"
+    field :width, :i32, description: "Characters across; rows follow the image's aspect", default: 116, min: 40, max: 200
+  end
+
+  tool :image_report, params: :ImageReportParams, title: "Read an image as text",
+       description: "Describe an image to a reader that cannot see it: dimensions and aspect, the mean colour and the six most common colours, then two character grids over the same cells, one for tone (dark to bright) and one for hue (red/yellow/green/cyan/blue/magenta, grey or desaturated as a dot). Use it when an image content block cannot be read directly.",
+       output: :TextReport, read_only: true, open_world: true do
+    body do |source, width|
+      args = "{\"source\":#{Json.quote(source)},\"width\":#{width}}"
+      data = Json.parse(run_script(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_extras), "IMAGE_REPORT", args)) || raise("could not parse the image report")
+      result(:TextReport, report: Json.text(data, "/report") || raise("the image script returned no text"))
     end
   end
 
@@ -450,5 +820,55 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     end
   end
 
+  params :Generate3dParams do
+    field :prompt, :string, description: "What to make, in plain words; one object, for example \"a weathered wooden treasure chest\". Give prompt or image, not both", optional: true
+    field :image, :string, description: "An absolute image file path or an http(s) URL to model from, instead of a prompt; images attached in chat cannot be passed", optional: true
+    field :name, :string, description: "Name for the imported object; unset derives one from the prompt", optional: true
+    field :provider, :string, description: "Which generator to use; auto prefers Tripo, then Hunyuan3D, then Hyper3D Rodin, whichever is enabled", enum: ["auto", "hyper3d", "hunyuan3d", "tripo"], default: "auto"
+    field :quality, :string, description: "Tripo and Hunyuan3D only, Premium: standard or high; omit for the user's default", enum: ["standard", "high"], optional: true
+    field :bbox_condition, :i64_list, description: "Hyper3D Rodin only: [length, width, height] proportions, three positive integers", optional: true
+    field :job, :string, description: "A handle from an earlier call, to resume waiting for that generation instead of starting a new one", optional: true
+    field :wait_seconds, :i32, description: "How long to wait before returning a job handle; a single call is capped at 45 seconds and generation usually takes 1-3 minutes", default: 45, min: 5, max: 300
+  end
+
+  tool :generate_3d, params: :Generate3dParams, title: "Generate a 3D model",
+       description: "Make one new textured 3D model from a text prompt or an image, and import it into the scene. One object per call, never a whole scene, the ground or parts to assemble. It arrives at arbitrary scale and facing; the reply reports its world_bounding_box and how to place it. Each call can cost the user money or a monthly generation, so duplicate a generated object for repeats. Waits up to wait_seconds (a single call is capped at 45 s), then imports; if it is not done in time the reply names the provider and gives a job handle to resume with, so a client timeout never strands a paid generation.",
+       destructive: true, open_world: true do
+    body do |prompt, image, name, provider, quality, bbox_condition, job, wait_seconds|
+      host = setting(:blender_host)
+      port = Integer(setting(:blender_port), 10)
+      scripts = setting(:blender_scripts)
+      got = prompt || ""
+      img = image || ""
+      wanted = name || ""
+      q = quality || ""
+      bbox_list = bbox_condition || []
+      bbox_json = gen_bbox(bbox_list)
+      resume = job || ""
+      seconds = Integer(wait_seconds.to_s, 10)
+      gen_run(host, port, scripts, got, img, wanted, provider, q, bbox_json, resume, seconds)
+    end
+  end
+
+  params :Make3dParams do
+    field :prompt, :string, description: "What to make, in plain words; one object, for example \"a weathered wooden treasure chest\""
+    field :name, :string, description: "Name for the imported object; unset derives one from the prompt", optional: true
+    field :job, :string, description: "A handle from an earlier call, to resume waiting for that generation instead of starting a new one", optional: true
+  end
+
+  tool :make_3d, params: :Make3dParams, title: "Quick generate a 3D model",
+       description: "Make one new textured 3D model from a single text prompt and import it into the scene: the quick path, which chooses the provider automatically and waits the same 45 seconds. Reach for generate_3d instead when you need to choose a provider, supply an image, or set quality or bbox_condition, or to wait longer than 45 seconds. Like generate_3d it makes one object, never a whole scene, ground or parts to assemble, and each call can cost the user money or a monthly generation. The reply reports the imported object's world_bounding_box and how to place it, or a job handle to resume with.",
+       destructive: true, open_world: true do
+    body do |prompt, name, job|
+      host = setting(:blender_host)
+      port = Integer(setting(:blender_port), 10)
+      scripts = setting(:blender_scripts)
+      wanted = name || ""
+      resume = job || ""
+      gen_run(host, port, scripts, prompt, "", wanted, "auto", "", "null", resume, 45)
+    end
+  end
+
   transport :http, port: 8787, auth_setting: :mcp_token
 end
+

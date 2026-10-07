@@ -186,3 +186,19 @@ arrives at arbitrary scale and facing, and the agent has to decide how to orient
 and size it. `mesh_report` gives the numbers (bbox, parts, orientation), and
 `wireframe` shows the shape — both as text. Without them, the agent is judging a
 mesh by a base64 image it cannot read.
+
+## A drawing must keep the image's aspect
+
+A character cell is about twice as tall as it is wide, so a grid of `COLS` x
+`ROWS` does not show the image's shape unless the row count follows the aspect:
+
+```python
+ROWS = max(6, int(round(COLS * (h / float(w)) / 2.0)))
+```
+
+This is not a detail. The first version of the image report mapped a 4400x6000
+image onto a fixed 116x34 grid, so every drawing came out about 1.5x too tall —
+letterforms looked "funky", and a header that said `600x381` next to a grid of
+116x34 was quietly describing two different pictures. Same rule as the
+wireframe: one scale, or the picture lies.
+

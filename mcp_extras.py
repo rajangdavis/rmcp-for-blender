@@ -171,3 +171,82 @@ lines.append("  face orientation " + str(dict(hist)))
 
 return {"report": "\n".join(lines)}
 '''
+
+IMAGE_REPORT = r'''
+import bpy, numpy as np
+
+source = ARGS.get("source") or ""
+cols = max(40, min(int(ARGS.get("width") or 116), 200))
+if source == "":
+    return {"report": "image_report needs an image already in the file, by name, or a path to load"}
+
+src = bpy.data.images.get(source)
+loaded = src is None
+if loaded:
+    try:
+        src = bpy.data.images.load(source)
+    except Exception as e:
+        return {"report": "cannot load %s: %s" % (source, e)}
+img = src
+ow, oh = img.size
+buf = np.empty(ow * oh * 4, dtype=np.float32)
+img.pixels.foreach_get(buf)
+a = buf.reshape(oh, ow, 4)[::-1, :, :3]
+
+lum = 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
+mean = [int(round(a[..., i].mean() * 255)) for i in range(3)]
+q = (np.clip(a, 0, 1) * 15).astype(np.uint8).reshape(-1, 3)
+keys = q[:, 0].astype(np.int32) * 256 + q[:, 1].astype(np.int32) * 16 + q[:, 2]
+uniq, counts = np.unique(keys, return_counts=True)
+total = float(keys.size)
+palette = ["#%02x%02x%02x %2.0f%%" % ((int(uniq[i]) // 256) * 17, ((int(uniq[i]) // 16) % 16) * 17,
+                                      (int(uniq[i]) % 16) * 17, 100.0 * counts[i] / total)
+           for i in np.argsort(-counts)[:6]]
+
+mx = a.max(axis=2)
+mn = a.min(axis=2)
+den = np.maximum(mx - mn, 1e-6)
+sat = np.where(mx > 0.01, (mx - mn) / np.maximum(mx, 1e-6), 0.0)
+hue = np.where(mx == a[..., 0], ((a[..., 1] - a[..., 2]) / den) % 6,
+               np.where(mx == a[..., 1], (a[..., 2] - a[..., 0]) / den + 2,
+                        (a[..., 0] - a[..., 1]) / den + 4)) * 60.0
+
+rows = max(6, int(round(cols * (oh / float(ow)) / 2.0)))   # 2:1 cell, true proportions
+ys = np.linspace(0, oh, rows + 1).astype(int)
+xs = np.linspace(0, ow, cols + 1).astype(int)
+grid = np.zeros((rows, cols), dtype=np.float32)
+for r in range(rows):
+    for c in range(cols):
+        cell = lum[ys[r]:ys[r + 1], xs[c]:xs[c + 1]]
+        grid[r, c] = float(cell.mean()) if cell.size else 0.0
+lo, hi = np.percentile(grid, 5), np.percentile(grid, 95)
+span = float(hi - lo) or 1.0
+tone_ramp = " .:-=+*#%@"
+hue_ramp = "RYGCBM"
+
+tone = []
+hues = []
+for r in range(rows):
+    tline = ""
+    hline = ""
+    for c in range(cols):
+        v = (grid[r, c] - lo) / span
+        tline += tone_ramp[max(0, min(len(tone_ramp) - 1, int(v * (len(tone_ramp) - 1))))]
+        cs = sat[ys[r]:ys[r + 1], xs[c]:xs[c + 1]]
+        ch = hue[ys[r]:ys[r + 1], xs[c]:xs[c + 1]]
+        hline += "." if (cs.size == 0 or float(cs.mean()) < 0.18) else hue_ramp[int(float(ch.mean()) // 60) % 6]
+    tone.append(tline)
+    hues.append(hline)
+
+lines = ["image %s  %dx%d  aspect %.3f  mean #%02x%02x%02x  grid %dx%d"
+         % (source, ow, oh, (ow / float(oh) if oh else 0), mean[0], mean[1], mean[2], cols, rows),
+         "palette " + ", ".join(palette),
+         "tone, dense = bright:"]
+lines.extend(tone)
+lines.append("hue: R red  Y yellow  G green  C cyan  B blue  M magenta  . grey or desaturated")
+lines.extend(hues)
+
+if loaded:
+    bpy.data.images.remove(img)
+return {"report": "\n".join(lines)}
+'''

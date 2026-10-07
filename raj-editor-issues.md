@@ -164,3 +164,48 @@ and diff was a user round trip — about a dozen of them in one session.
 every verification is the user's; that is a property of the setup, and knowing it
 up front would have shaped the whole session (the user offered exactly this
 mid-way, as "hooks").
+
+## 11. Two writers on one file, and a copy that truncates first, cost the file
+
+The expensive one, and it was self-inflicted: a background review agent was
+launched against the same buffer the user was saving and building. The sequence
+that lost the file:
+
+1. two agents wrote to `blender.rmcp.rb` while the user was saving it;
+2. the result was written to disk by a copy idiom that truncates **before** the
+   pipeline runs:
+
+   ```bash
+   raj ctl read --json F | jq -r .text > F     # the shell empties F first
+   ```
+
+   so when that `read` returned nothing, `F` was left as a single newline — and
+   `jq -r` printing an empty string is exactly a 1-byte file, which is what the
+   buffer synced to;
+3. with the buffer and the disk agreeing on emptiness, the file was gone from
+   both sides, and no `revert`/`clear`/proposal could bring it back.
+
+What actually recovered it:
+
+- the **harness's stored tool output** held a byte-exact snapshot of the file
+  (454 lines) from an earlier `raj ctl read` — a copy nobody meant to make;
+- `build/<name>/src/main.rs` held the *generated* code of the final file, so the
+  re-application could be **proved** equivalent: rebuild, then diff the newly
+  generated file against the preserved one, normalising only the
+  `FILE:LINE:COL` strings that line numbers move. An empty diff ended the
+  argument.
+
+Two habits worth keeping:
+
+- **Copy safely** — write beside the target, check it, then rename:
+
+  ```bash
+  raj ctl read --json "$F" | jq -r .text > "$F.new" &&
+    test -s "$F.new" && grep -q '^server ' "$F.new" && mv "$F.new" "$F"
+  ```
+
+  `mv` cannot leave a truncated original, and a failed read cannot damage the
+  target at all.
+- **One writer per file.** `dev.sh` now refuses to start twice for the same
+  reason; a background agent counts as a writer.
+

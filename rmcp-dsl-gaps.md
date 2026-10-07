@@ -273,3 +273,117 @@ warning is noise an author cannot act on (the same family as #11).
 - A typed list reaches a Python script: `views: ["front","right"]` arrived as a
   JSON array and the script reported exactly those two, while omitting `views`
   produced its four defaults.
+
+## Third session (2026-10-07)
+
+### 20. `runtime` — `transport :http` trusts loopback only, and nothing can change that
+
+The HTTP transport is the one that makes the server usable by an agent that is
+not on the same machine — the whole point of driving Blender from a sandbox. It
+binds `127.0.0.1`, and rmcp enforces a DNS-rebinding **host check**: a request
+whose `Host` is not a loopback value is refused with
+`Forbidden: Host header is not allowed`.
+
+Every real MCP client sends the **URL's own authority** as `Host`. Captured from
+opencode against a local probe:
+
+```
+POST /mcp?codemode=false
+host: 127.0.0.1:9999        # exactly the URL it dialled
+authorization: Bearer …
+user-agent: opencode/latest/2.0.20/cli
+```
+
+So a client **on the host** works (`http://127.0.0.1:8787/mcp`), and a client
+**across a boundary** — a container, another machine — cannot, because it must
+dial something other than loopback and will present a `Host` the check refuses.
+The transport's only knobs are `port:`, `auth_setting:` and the OAuth fields:
+there is no `allowed_hosts:`, no bind address, and no way to disable the check.
+
+**Workaround, and why it does not count:** a hand-written client can set
+`Host: 127.0.0.1:<port>` itself while dialling the real address — a real MCP
+client cannot, so the case stays unsolved.
+
+**Suggest:** an `allowed_hosts:` keyword on `transport :http` (seeding rmcp's
+check), and/or a `bind:` address. The bearer token is already the authentication
+story; the host check is a browser-oriented defence and is the wrong default for
+a token-bearing service meant to be reached from elsewhere.
+
+### 21. `language` — a `String` local cannot be borrowed or cloned
+
+Moving a `String` local in one branch and reading it in another is a Rust error:
+
+```
+error[E0382]: borrow of moved value: `url0`
+blender.rmcp.rb:245: error: use of moved value: `url1` (in helper `gen_poll`)
+```
+
+rustc's own suggestion is to `.clone()` at the move site. The DSL has neither
+`.clone` nor `.dup`, and no borrow syntax, so the only remedy is to
+**restructure** so each local is moved on at most one path and never read after:
+
+```ruby
+# both statements, url0/url1 move in the first and are read in the second
+glb = if type0 == "GLB" then url0 elsif type1 == "GLB" then url1 else "" end
+model = if glb != "" then glb elsif url0 != "" then url0 else url1 end
+
+# one expression, each local read once on any path
+model = if type0 == "GLB" then url0 elsif type1 == "GLB" then url1 elsif url0 != "" then url0 else url1 end
+```
+
+**Suggest:** allow `.clone`/`.dup` (a Rust `.clone()`), or document the
+restructure rule beside gap #17, which is the same move semantics seen through
+`||`.
+
+### 22. `codegen` — a cast operand is parenthesised, and rustc says so
+
+`handle[provider.length + 1, …]` compiles to
+`ck_add_i64((provider.chars().count() as i64), 1, …)`, and rustc warns:
+
+```
+warning: unnecessary parentheses around function argument
+  --> src/main.rs:834   (blender.rmcp.rb:368, in helper `gen_wait`)
+```
+
+Hoisting the length into a plain local first (`plen = provider.length`) avoids
+the cast and, we believe, the warning — that build has not been read back, so
+treat the fix as unconfirmed.
+
+**Suggest:** do not parenthesise a cast operand when emitting a call argument.
+
+### 23. `language` — no exception handling, so retries and fallbacks are written as values
+
+Errors are `raise`d and cannot be caught: the body language has no `begin`/`rescue`
+and no `catch`. `.each { … }` loops cannot carry state between iterations either
+(reassigning an outer local is refused), so a fallback cannot be written as
+control flow:
+
+```ruby
+# the shape one reaches for, and cannot have
+begin
+  submit(provider_a)
+rescue
+  submit(provider_b)
+end
+```
+
+What *is* expressible is the value form — turn failure into data, then choose:
+
+```ruby
+a = attempt(provider_a)                 # raises nothing: "" or {"problem": …}
+b = if a == "" then attempt(provider_b) else "" end
+```
+
+at the cost of an explicit attempt per candidate, unrolled, plus a
+non-raising variant of every helper that needs it. `xs[i]`, `xs.first` and
+`xs.last` exist (all nil-able), so the unrolled form at least works.
+
+This surfaced on `generate_3d`'s `auto` provider choice: the addon's `enabled`
+flag does **not** mean reachable (Hunyuan3D reports `enabled: true` with nothing
+listening on its local API), so the first "enabled" provider is a dead socket and
+the call fails where a fallback should have moved on. Python gets this with
+`try`/`except`.
+
+**Suggest:** document "failures are values, not exceptions" as *the* retry
+pattern (it is easy to reach for `rescue` first), or allow a `rescue`-like form.
+
