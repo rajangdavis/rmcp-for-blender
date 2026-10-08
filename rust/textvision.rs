@@ -1,10 +1,10 @@
 //! Reading an image as text, in Rust.
 //!
 //! The counterpart of the Python script in python/mcp_scripts.py, and then some:
-//! `numbers` is the plain facts (the same first line the Python prints, so the two
-//! can be compared on one file), and `grid` is the text-vision view — a tone grid,
-//! a hue-and-strength grid, a spectrum ordered by hue, and a summary that names
-//! what is in the picture and where.
+//! `grid` is the text-vision view — the plain facts on one line plus a palette (the
+//! same first line the Python prints, so the two can be compared on one file), then
+//! a tone grid, a hue-and-strength grid, a spectrum ordered by hue, and a summary
+//! that names what is in the picture and where.
 //!
 //! Doing this here rather than inside Blender buys three things: it is fast, it
 //! needs no Blender session at all, and it has unit tests — a file of pixels and
@@ -38,28 +38,46 @@ fn load(path: &str, cols: u32, cell_aspect: f64) -> Result<Stats, String> {
         ((cols as f64) * (height as f64) / (width as f64) / cell_aspect).round().max(1.0) as u32
     };
     let mut sums = [0u64; 3];
-    let mut buckets: HashMap<u32, u64> = HashMap::new();
+    // A 4-bit-per-channel key is only 12 bits, so a fixed 4096-slot array beats a
+    // HashMap: one indexed increment per pixel instead of a SipHash insert, which
+    // is what made the Rust palette slower than numpy's vectorised `unique` at
+    // 1 MP. The array is the whole key space, so ranking is a scan of 4096 slots.
+    let mut buckets = [0u64; 4096];
     let mut cell_sums = vec![[0f64; 3]; (cols * rows) as usize];
     let mut cell_counts = vec![0u64; (cols * rows) as usize];
-    for (x, y, pixel) in source.enumerate_pixels() {
-        let channels = [pixel[0] as u64, pixel[1] as u64, pixel[2] as u64];
-        for i in 0..3 {
-            sums[i] += channels[i];
+    // Iterate the raw RGB8 buffer and hoist the cell index out of the inner loop:
+    // the per-pixel `(x * cols) / width` division dominated the profile at 2048².
+    // `cx` is the same for every pixel in a column and `cy` for every pixel in a
+    // row, so both are precomputed and the inner loop does adds only.
+    let raw = source.as_raw();
+    let stride = width as usize * 3;
+    let cx_of: Vec<usize> = (0..width as usize)
+        .map(|x| ((x as u64 * cols as u64) / (width.max(1) as u64)).min(cols as u64 - 1) as usize)
+        .collect();
+    for y in 0..height as usize {
+        let cy = ((y as u64 * rows as u64) / (height.max(1) as u64)).min(rows as u64 - 1) as usize;
+        let row = cy * cols as usize;
+        let mut off = y * stride;
+        for x in 0..width as usize {
+            let r = raw[off] as u64;
+            let g = raw[off + 1] as u64;
+            let b = raw[off + 2] as u64;
+            off += 3;
+            sums[0] += r;
+            sums[1] += g;
+            sums[2] += b;
+            // The same 4-bit-per-channel quantisation the Python script uses: scale
+            // by 15 rather than dividing by 16, so the two agree bucket for bucket.
+            let key = (((r * 15 / 255) as u32) << 8)
+                | (((g * 15 / 255) as u32) << 4)
+                | ((b * 15 / 255) as u32);
+            buckets[key as usize] += 1;
+            let index = row + cx_of[x];
+            cell_sums[index][0] += r as f64;
+            cell_sums[index][1] += g as f64;
+            cell_sums[index][2] += b as f64;
+            cell_counts[index] += 1;
         }
-        // The same 4-bit-per-channel quantisation the Python script uses: scale by
-        // 15 rather than dividing by 16, so the two agree bucket for bucket
-        // (integer division, so it floors, where the Python floors too).
-        let key = (((channels[0] * 15 / 255) as u32) << 8)
-            | (((channels[1] * 15 / 255) as u32) << 4)
-            | ((channels[2] * 15 / 255) as u32);
-        *buckets.entry(key).or_insert(0) += 1;
-        let cx = ((x as u64 * cols as u64) / (width.max(1) as u64)) as usize;
-        let cy = ((y as u64 * rows as u64) / (height.max(1) as u64)) as usize;
-        let index = cy.min(rows as usize - 1) * cols as usize + cx.min(cols as usize - 1);
-        for i in 0..3 {
-            cell_sums[index][i] += channels[i] as f64;
-        }
-        cell_counts[index] += 1;
     }
     let cells: Vec<[f64; 3]> = cell_sums
         .iter()
@@ -70,7 +88,10 @@ fn load(path: &str, cols: u32, cell_aspect: f64) -> Result<Stats, String> {
         })
         .collect();
     let pixels = ((width as u64) * (height as u64)).max(1);
-    let mut ranked: Vec<(u32, u64)> = buckets.into_iter().collect();
+    let mut ranked: Vec<(u32, u64)> = (0..4096u32)
+        .filter(|key| buckets[*key as usize] > 0)
+        .map(|key| (key, buckets[key as usize]))
+        .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1));
     Ok(Stats {
         width,
@@ -169,15 +190,6 @@ fn numbers_line(path: &str, stats: &Stats) -> String {
         path, stats.width, stats.height, aspect, stats.mean[0], stats.mean[1], stats.mean[2],
         stats.cols, stats.rows
     )
-}
-
-/// Dimensions, aspect, mean colour and the most common colours: the plain facts,
-/// on one line plus a palette, matching what the Python script reports first.
-pub fn numbers(path: &str) -> String {
-    match load(path, 1, 1.0) {
-        Ok(stats) => format!("{}\n{}", numbers_line(path, &stats), palette_line(&stats, 6)),
-        Err(message) => message,
-    }
 }
 
 const TONE: &[u8] = b" .:-=+*#%@";
@@ -631,7 +643,7 @@ mod ansi_tests {
 #[cfg(test)]
 mod tests {
 
-    use super::{grid, numbers};
+    use super::grid;
 
     fn flat(path: &str, colour: [u8; 3], width: u32, height: u32) {
         let mut image = image::RgbImage::new(width, height);
@@ -649,7 +661,7 @@ mod tests {
     fn reads_dimensions_aspect_and_mean_of_a_known_image() {
         let path = temp("textvision-flat.png");
         flat(&path, [63, 169, 245], 4, 2);
-        let text = numbers(&path);
+        let text = grid(&path, 80);
         assert!(text.contains("4x2"), "dimensions missing: {}", text);
         assert!(text.contains("aspect 2.000"), "aspect missing: {}", text);
         assert!(text.contains("mean #3fa9f5"), "mean missing: {}", text);
@@ -663,8 +675,6 @@ mod tests {
 
     #[test]
     fn says_so_when_the_file_is_not_there() {
-        let text = numbers("/definitely/not/here.png");
-        assert!(text.starts_with("cannot load"), "unexpected: {}", text);
         let text = grid("/definitely/not/here.png", 80);
         assert!(text.starts_with("cannot load"), "unexpected: {}", text);
     }

@@ -5,7 +5,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
 
   # The addon bridge lives in hand-written Rust beside this file: one persistent
   # connection, one command at a time, the reply back as JSON text.
-  rust_file "blender_bridge.rs", as: :blender_bridge
+  rust_file "rust/blender_bridge.rs", as: :blender_bridge
   rust_fn :blender_call, args: [:string, :i64, :string], returns: :string, from: :blender_bridge
 
   # Ruby's strip and Rust's trim() agree on the text these tools handle (script
@@ -24,7 +24,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   # async too, and the tool bodies that reach it (generate_3d, make_3d) await the
   # whole chain; the DSL infers that from the call, so no helper declares async.
   # base64 is already a binding crate, so blender_gen.rs may use it too.
-  rust_file "blender_gen.rs", as: :blender_gen
+  rust_file "rust/blender_gen.rs", as: :blender_gen
   rust_fn :sleep_ms, args: [:i64], returns: :i64, async: true, from: :blender_gen
   rust_fn :gen_file_base64, args: [:string], returns: :string, from: :blender_gen
   rust_fn :gen_path_suffix, args: [:string], returns: :string, from: :blender_gen
@@ -34,7 +34,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   # arithmetic is unit-testable with cargo test and needs no Blender session.
   # The image crate is declared in bindings/imagefile.rb; dependencies land in
   # the crate's Cargo.toml, so this module can use it directly.
-  rust_file "textvision.rs", as: :textvision
+  rust_file "rust/textvision.rs", as: :textvision
   rust_fn :grid, args: [:string, :i32], returns: :string, from: :textvision
   rust_fn :ansi, args: [:string, :i32, :string, :string], returns: :string, from: :textvision
 
@@ -47,7 +47,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   # One command over the bridge: send, check the addon's status, and return the
   # result as JSON text (helpers cannot carry an opaque Json::Value).
   helper :blender_request, args: [:string, :i64, :string], returns: :string do |host, port, request|
-    resp = Json.parse(rust(:blender_call, host, port, request)) || raise("Blender bridge unreachable; start the addon's server in Blender")
+    resp = Json.parse(rust(:blender_call, host, port, request)) || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")
     status = Json.text(resp, "/status") || "error"
     raise (Json.text(resp, "/message") || "Blender returned an error") unless status == "success"
     Json.dump(Json.at(resp, "/result") || raise("the bridge returned no result")) || raise("could not encode the result")
@@ -70,14 +70,14 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     invoke_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(invoke)}}}"
     install_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(install)}}}"
     raw = Json.parse(rust(:blender_call, host, port, invoke_request))
-    resp = raw || raise("Blender bridge unreachable; start the addon's server in Blender")
+    resp = raw || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")
     status = Json.text(resp, "/status") || "error"
     stdout = Json.text(resp, "/result/result") || ""
     cold = if rust(:trim_text, stdout) == "__MCP_NEED_INSTALL__" then true else false end
     # A cold Blender has not seen this script yet: installing it and running it
     # in one more command costs a round trip once, and every later call sends
     # only the short invocation above.
-    retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable; start the addon's server in Blender")) else resp end
+    retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")) else resp end
     retry_status = if cold then (Json.text(retry_resp, "/status") || "error") else status end
     retry_stdout = if cold then (Json.text(retry_resp, "/result/result") || "") else stdout end
     raise (Json.text(retry_resp, "/message") || "Blender returned an error") unless retry_status == "success"
@@ -105,11 +105,11 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     invoke_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(invoke)}}}"
     install_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(install)}}}"
     raw = Json.parse(rust(:blender_call, host, port, invoke_request))
-    resp = raw || raise("Blender bridge unreachable; start the addon's server in Blender")
+    resp = raw || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")
     status = Json.text(resp, "/status") || "error"
     stdout = Json.text(resp, "/result/result") || ""
     cold = if rust(:trim_text, stdout) == "__MCP_NEED_INSTALL__" then true else false end
-    retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable; start the addon's server in Blender")) else resp end
+    retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")) else resp end
     retry_status = if cold then (Json.text(retry_resp, "/status") || "error") else status end
     retry_stdout = if cold then (Json.text(retry_resp, "/result/result") || "") else stdout end
     raise (Json.text(retry_resp, "/message") || "Blender returned an error") unless retry_status == "success"
@@ -576,7 +576,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
 
   params :ImageReportRustParams do
     field :source, :string, description: "Path to an image file on the machine this server runs on"
-    field :width, :i32, description: "Cells across; rows follow the image's aspect at 2:1 cells", default: 96, min: 40, max: 200
+    field :width, :i32, description: "Cells across; rows follow the image's aspect at 2:1 cells", default: 116, min: 40, max: 200
   end
 
   tool :image_report_rust, params: :ImageReportRustParams, title: "Read an image as text (Rust)",
@@ -1239,6 +1239,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     end
   end
 
-  transport :http, port: 8787, auth_setting: :mcp_token
+  transport :http, port: 8787, auth_setting: :mcp_token,
+          allowed_hosts: ["host.docker.internal", "127.0.0.1", "localhost"]
 end
 

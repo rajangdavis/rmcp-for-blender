@@ -32,9 +32,16 @@ listens and never reads stdin, and piping into it simply hangs.
 
 **Host header.** rmcp enforces a DNS-rebinding check and answers `Forbidden: Host
 header is not allowed` unless `Host` is one it trusts (`127.0.0.1:<port>`,
-`localhost`). A client reaching the server from another host must connect to
-`host.docker.internal` but present `Host: 127.0.0.1:8787`; `fetch` cannot set `Host`
-(it is a forbidden header name), so use `node:http`, or `curl -H 'Host: …'`.
+`localhost`). The transport answers it: `transport :http` takes
+`allowed_hosts:` — the exact `Host` names the check trusts, which **replaces** the
+loopback defaults, so list them too: `["host.docker.internal", "127.0.0.1", "localhost"]`
+(and `bind:` to widen the listen address). A client that dials
+`host.docker.internal:8787` and sends that same authority is then accepted —
+verified: loopback and that name get `200`, an unlisted one `403`, and the port is
+ignored.
+Only for a server without `allowed_hosts:` must a hand-written client present
+`Host: 127.0.0.1:8787` while dialling the real address; `fetch` cannot set `Host`
+(a forbidden header name), so use `node:http` or `curl -H 'Host: …'`.
 
 **SSE framing.** Replies are `text/event-stream` whose first `data:` line is empty:
 
@@ -106,9 +113,10 @@ cargo.
 
 ## Clients
 
-`mcp.sh` (curl + jq) offers `tool NAME 'JSON'`, `code FILE.py` and `raw FILE`; add
-`MCP_HOST_HEADER` when calling across a sandbox boundary. A node variant over
-`node:http` covers sandboxes without curl. Both render text blocks as text and
+`mcp.sh` (curl + jq) offers `tool NAME 'JSON'`, `code FILE.py` and `raw FILE`; set
+`MCP_URL=http://host.docker.internal:8787/mcp` to call across a sandbox boundary,
+and `MCP_HOST_HEADER` only for a server that has not set `allowed_hosts:`. A node
+variant over `node:http` covers sandboxes without curl. Both render text blocks as text and
 summarise images (`[image image/png 82 KB omitted]`) — the base64 is never useful to
 a text agent, and a 78x34 wireframe is ~1 KB against ~80 KB for a screenshot.
 
@@ -131,14 +139,18 @@ today), **typing** (expressible only through an opaque `Json::Value`), **ergonom
 behaviour), and ordered by how much each slowed the work. Editor issues from the
 same sessions are in `docs/editor-issues.md`.
 
-### 1. `language` — a tool cannot take no arguments
+Items **1**, **2**, **4**, **7**, **10**, **11**, **19**, **20**, **22**, **25**, **27**, **28** and
+**30** are resolved by the 2026-10-07 `rmcp_dsl` update and tagged below; the rest
+remain open.
+
+### 1. `language` — a tool cannot take no arguments — **resolved**
 
 `params` must declare at least one `field`, so an empty argument object is not
 expressible (`params :NoArgs do end` answers `needs at least one field`), though
 argument-less tools (`ping`, "current time") are common. **Suggest:** allow an empty
 `params`, or make `params:` optional.
 
-### 2. `typing` — binding return types have no float (or i32) arrays
+### 2. `typing` — binding return types have no float (or i32) arrays — **resolved**
 
 `T::Array[Float]` is refused — the allowed binding returns are `String`, `Float`,
 `I32`, `I64`, `T::Boolean`, `T::Array[String]`, `T::Array[I64]`, `Json::Value` — so
@@ -154,7 +166,7 @@ and outputs — so schemas and editor types cannot describe a row and
 `Html.select`/`Html.attr` stay column-oriented (20 names and 20 links, not 20 rows).
 **Suggest:** a record type, or a `rows` helper on the HTML binding.
 
-### 4. `language` — no `nil` literal in a body
+### 4. `language` — no `nil` literal in a body — **resolved**
 
 An optional output field or "no value" result cannot be produced; the body invents a
 sentinel, with `... : nil` an unsupported `NilNode`. **Suggest:** allow `nil` where a
@@ -172,7 +184,7 @@ cast, or hint at the fix.
 Numeric config needs `Integer(setting(:blender_port), 10)`. **Suggest:** a typed
 setting (`setting :port, type: :i64`), or `setting(:x).to_i`.
 
-### 7. `ergonomics` — building a JSON request in a body is awkward
+### 7. `ergonomics` — building a JSON request in a body is awkward — **resolved**
 
 A nested request body needs a binding `quote` helper plus interpolation; typed maps
 stop short of a nested request object. **Suggest:** `to_json` on maps, or a map/JSON
@@ -192,13 +204,13 @@ changes, and an unsaved binding buffer is invisible to both the LSP and
 `rmcp_dsl build`. **Suggest:** watch `bindings/` and invalidate on change, and read
 it from open buffers so proposals can be checked before saving.
 
-### 10. `ergonomics` — terse type-mismatch messages
+### 10. `ergonomics` — terse type-mismatch messages — **resolved**
 
 `type mismatch: str vs string` names the types but not the fix. **Suggest:** a
 trailing hint, as the compiler already gives elsewhere ("did you mean ...", "use
 `|| default` ...").
 
-### 11. `codegen` — the settings check can warn (`unused_mut`)
+### 11. `codegen` — the settings check can warn (`unused_mut`) — **resolved**
 
 The settings check always emits `let mut missing: Vec<&str>`, so a server whose
 settings all have defaults warns `unused_mut` at the generated line. The crate is
@@ -265,14 +277,14 @@ it`, yet `instructions:` is a page of prose, the keyword most likely to want one
 **Suggest:** accept `<<~` (and for other string-literal keywords), or state in the
 grammar that a string literal is the only form.
 
-### 19. `codegen` — `W-STR-STRIP-RUBY` fires on `.strip`
+### 19. `codegen` — `W-STR-STRIP-RUBY` fires on `.strip` — **resolved**
 
 `ruby strip ... compiles to an explicit-set trim, not Rust trim()` is emitted for
 ordinary `.strip` calls even though the emitted trim is correct — noise an author
 cannot act on (the same family as #11). **Suggest:** keep it silent when the
 semantics coincide, or make it a notice.
 
-### 20. `runtime` — `transport :http` trusts loopback only, and nothing can change that
+### 20. `runtime` — `transport :http` trusts loopback only — **resolved**
 
 The HTTP transport exists so an agent off the machine can reach the server, yet it
 binds `127.0.0.1` and rmcp's host check refuses any non-loopback `Host`. Real clients
@@ -292,7 +304,7 @@ to restructure so each local is moved on one path and read once on any path.
 **Suggest:** allow `.clone`/`.dup`, or document the rule beside #17, the same move
 semantics seen through `||`.
 
-### 22. `codegen` — a cast operand is parenthesised, and rustc says so
+### 22. `codegen` — a cast operand is parenthesised, and rustc says so — **resolved**
 
 `handle[provider.length + 1, …]` emits
 `ck_add_i64((provider.chars().count() as i64), 1, …)` and rustc warns `unnecessary
@@ -318,7 +330,7 @@ protocol this project already implemented once. **Suggest:** accept a list
 (`transport :stdio, :http`) or a second declaration; failing that, a generated
 stdio↔http bridge.
 
-### 25. `ergonomics` — the required-list diagnostic does not say "required"
+### 25. `ergonomics` — the required-list diagnostic does not say "required" — **resolved**
 
 When the left operand of `||` is a required `Vec<String>`, `names || []` answers `an
 array literal needs at least one element` instead of saying `names` is not nilable —
@@ -332,7 +344,7 @@ An unbalanced `end` one tool above surfaced as `unsupported CallNode as a statem
 wrong body. **Suggest:** when a body contains a construct that only belongs at the
 top level, name the still-open `tool :x` and the line it opened at.
 
-### 27. `tooling` — a binding that is never loaded fails as a missing crate, two steps later
+### 27. `tooling` — a binding that is never loaded fails as a missing crate, two steps later — **resolved**
 
 A `bindings/*.rb` that no `use_bindings` names is never parsed, so its crates never
 reach `Cargo.toml` and the failure surfaces two steps later as `cannot find module
@@ -341,7 +353,7 @@ or crate 'image'` in a `rust_file` — aimed at the injected file, while the LSP
 is silent. **Suggest:** warn when a `bindings/` `.rb` beside the DSL file is named by
 no `use_bindings`: "its crates are not declared".
 
-### 28. `tooling` — the `rust_fn` name *is* the Rust function's name, and no reference says so
+### 28. `tooling` — the `rust_fn` name *is* the Rust function's name, and no reference says so — **resolved**
 
 `rust_fn :image_numbers, from: :textvision` emits `textvision::image_numbers(...)`,
 so the module must define exactly that name; it defined `numbers` and the build
@@ -359,7 +371,7 @@ failing with old messages, `Finished in 0.36s` the only clue nothing recompiled.
 compiler knows the set and hashes it anyway. **Suggest:** print the input paths on a
 successful build, one per line, or add `--print-inputs`.
 
-### 30. `tooling` — checked arithmetic is emitted with redundant parentheses
+### 30. `tooling` — checked arithmetic is emitted with redundant parentheses — **resolved**
 
 A cast inside a checked operation is emitted parenthesised inside the call, so
 rustc prints three `unused_parens` warnings: ``ck_sub_i64((word.chars().count() as

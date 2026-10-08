@@ -294,6 +294,41 @@ and until then the redirect above is that verb, done manually.
 
 Still missing, and it cost a call on its own: **no way to ask whether a buffer is
 backed by a file**. `buffers` reports `unsaved-changes` for a buffer whose file has
-never been written, which is what `blender-tools/SKILL.md` was — a tab with 69 lines
+never been written, which is what `rmcp-blender-skills/SKILL.md` was — a tab with 69 lines
 and no file behind it. Issue 2's undefined `read --disk` is the verb that would
 answer it.
+
+## 16. Agent `rename` reports success but moves nothing
+
+`raj ctl rename tools/gigan_build.py tools/garment.py` answered
+`renamed tools/gigan_build.py to tools/garment.py`, but `ls tools` still listed the
+old name, `read tools/garment.py` found no file, and `proposals` showed no pending
+move. Re-running changed nothing, so the only way to rename was copy-then-delete:
+read the old buffer, `open --create` the new path, `apply` the text, save, then
+`delete` the old — four calls and a confirm where one rename was asked for.
+
+**Why it matters.** A rename that reports success and does nothing is worse than a
+refusal: a driver that trusts the reply goes on to reference a path that does not
+exist.
+
+**Suggest:** do the move or refuse it; do not reply "renamed" for a move that did not
+happen.
+
+## 17. A stale directory-removal dialog wedges the editor and cannot be withdrawn
+
+A `rmdir dev/gaps` proposal opened a `Remove directory 1/21` modal in the client
+listing every file. The proposal was then withdrawn over the socket (`rmdir
+--withdraw dev/gaps`, and `rmdirs` reported none), but the modal stayed up. Its
+`Withdraw` button had nothing left to act on, so it could not close — and while it
+was up it held editor input: `open`/`reveal` did not bring tabs to the front, and a
+`rename` issued in that window silently did not apply.
+
+**Why it matters.** A modal that outlives its proposal turns a harmless cleanup into
+a wedged workspace, and every socket reply in the meantime is true but invisible.
+Recovery was a client-side dismiss the agent could not perform, and the human could
+not either once the proposal was gone.
+
+**Suggest:** close the dialog when the proposal disappears server-side, and make the
+buttons idempotent — Withdraw on an already-withdrawn proposal should succeed and
+close rather than dead-end. An empty-directory removal should not enumerate files it
+is not removing.

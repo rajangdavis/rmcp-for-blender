@@ -12,9 +12,13 @@ Found while building `blender.rmcp.rb` (a Rust MCP server over the
 
 Ordered by how much each one slowed the work. Editor-side issues found in the
 same sessions (saving, stale buffers, LSP caching, claim sets) are recorded
-separately in `raj-editor-issues.md`.
+separately in `editor-issues.md`.
 
-## 1. `language` — a tool cannot take no arguments
+**Update 2026-10-07:** items **1**, **2**, **4**, **7**, **10**, **11**, **19**, **20**, **22**,
+**25**, **27** and **28** are resolved in `rmcp_dsl` and tagged below; the rest
+remain open.
+
+## 1. `language` — a tool cannot take no arguments — **resolved**
 
 `params` must declare at least one `field`, so an MCP tool with an empty
 argument object is not expressible.
@@ -30,7 +34,7 @@ Argument-less tools are common in MCP (the Blender addon's `get_scene_info`,
 *Workaround:* point the tool at a sibling command that does take arguments.
 **Suggest:** allow an empty `params`, or make `params:` optional on a tool.
 
-## 2. `typing` — binding return types have no float (or i32) arrays
+## 2. `typing` — binding return types have no float (or i32) arrays — **resolved**
 
 `T.nilable(T::Array[Float])` is refused. The allowed set is `String`, `Float`,
 `I32`, `I64`, `T::Boolean`, `T::Array[String]`, `T::Array[I64]`, `Json::Value`.
@@ -51,7 +55,7 @@ then, `Html.select`/`Html.attr` stay column-oriented (20 names and 20 links, not
 20 rows) and row data is opaque.
 **Suggest:** a record type, or ship a `rows` helper on the HTML binding.
 
-## 4. `language` — no `nil` literal in a body
+## 4. `language` — no `nil` literal in a body — **resolved**
 
 An optional output field or a "no value" result cannot be produced; the body
 must invent a sentinel.
@@ -80,7 +84,7 @@ Numeric config must be parsed by hand: `Integer(setting(:blender_port), 10)`.
 *Workaround:* `Integer(setting(:x), 10)`.
 **Suggest:** a typed setting (`setting :port, type: :i64`), or `setting(:x).to_i`.
 
-## 7. `ergonomics` — building a JSON request in a body is awkward
+## 7. `ergonomics` — building a JSON request in a body is awkward — **resolved**
 
 Forming `{"type":"execute_code","params":{"code":<quoted>}}` needed a binding
 `quote` helper plus string interpolation; there is no way to build arbitrary
@@ -106,13 +110,13 @@ Repro: create and save `bindings/json.rb`, run diagnostics on the server → sti
 **Suggest:** watch `bindings/` and invalidate on change, and consider reading
 bindings from open buffers so proposals can be checked before saving.
 
-## 10. `ergonomics` — terse type-mismatch messages
+## 10. `ergonomics` — terse type-mismatch messages — **resolved**
 
 `type mismatch: str vs string` names the types but not the fix, and neither does
 the `+` case. A trailing hint would save a round trip — the compiler already does
 this well elsewhere ("did you mean ...", "use `|| default` ...").
 
-## 11. `codegen` — generated code can warn (`unused_mut`)
+## 11. `codegen` — generated code can warn (`unused_mut`) — **resolved**
 
 Building the Blender server (which has no required settings) emits:
 
@@ -254,7 +258,7 @@ keyword most likely to want one.
 **Suggest:** accept `<<~` here (and for other string-literal keywords), or state
 in the grammar that a string literal is the only form.
 
-## 19. `codegen` — `W-STR-STRIP-RUBY` fires on `.strip`
+## 19. `codegen` — `W-STR-STRIP-RUBY` fires on `.strip` — **resolved**
 
 `ruby strip (NUL and ASCII whitespace) compiles to an explicit-set trim, not
 Rust trim()` — emitted for two ordinary `.strip` calls. The trim is correct; the
@@ -276,7 +280,7 @@ warning is noise an author cannot act on (the same family as #11).
 
 ## Third session (2026-10-07)
 
-### 20. `runtime` — `transport :http` trusts loopback only, and nothing can change that
+### 20. `runtime` — `transport :http` trusts loopback only — **resolved**
 
 The HTTP transport is the one that makes the server usable by an agent that is
 not on the same machine — the whole point of driving Blender from a sandbox. It
@@ -335,7 +339,7 @@ model = if type0 == "GLB" then url0 elsif type1 == "GLB" then url1 elsif url0 !=
 restructure rule beside gap #17, which is the same move semantics seen through
 `||`.
 
-### 22. `codegen` — a cast operand is parenthesised, and rustc says so
+### 22. `codegen` — a cast operand is parenthesised, and rustc says so — **resolved**
 
 `handle[provider.length + 1, …]` compiles to
 `ck_add_i64((provider.chars().count() as i64), 1, …)`, and rustc warns:
@@ -428,7 +432,7 @@ Failing that, a generated stdio<->http bridge is a smaller thing to hand a user
 than "write a proxy", and it is the same machinery the HTTP transport already
 has.
 
-### 25. `ergonomics` — the required-list diagnostic does not say "required"
+### 25. `ergonomics` — the required-list diagnostic does not say "required" — **resolved**
 
 ```ruby
 field :names, :string_list, description: "..."   # required
@@ -475,7 +479,7 @@ level, add "and the enclosing `tool :x` body, opened at line N, is still open".
   DSL line and helper rather than the emitted expression.
 
 
-### 27. `tooling` — a binding that is never loaded fails as a missing crate, two steps later
+### 27. `tooling` — a binding that is never loaded fails as a missing crate, two steps later — **resolved**
 
 `bindings/imagefile.rb` declared `crate "image", "0.25"`; nothing called it, and no
 `use_bindings :imagefile` was added. The file was therefore never parsed, its crate
@@ -581,7 +585,7 @@ warning: `blender` (bin "blender" test) generated 3 warnings
 error: could not compile `blender` (bin "blender" test) due to 1 previous error; 3 warnings emitted
 rajandavis ~/Desktop/projects/mcp_true_test on main[!?]
 $
-### 28. `tooling` — the `rust_fn` name *is* the Rust function's name, and no reference says so
+### 28. `tooling` — the `rust_fn` name *is* the Rust function's name, and no reference says so — **resolved**
 
 ```ruby
 rust_fn :image_numbers, args: [:string], returns: :string, from: :textvision
@@ -618,3 +622,21 @@ file, every `use_bindings` file and every `rust_file`, resolves them (including 
 `--print-inputs`. A watcher built from that list is correct by construction; one
 maintained by hand was wrong twice in a day, and both times the symptom pointed at
 the tests rather than at the missing build.
+
+### 30. `runtime` — `allowed_hosts:` replaces the loopback defaults, silently
+
+Setting `allowed_hosts: ["host.docker.internal"]` on `transport :http` makes the
+server trust **only** that name: `127.0.0.1` and `localhost`, trusted by default,
+start answering `403 Forbidden: Host header is not allowed`. A host-side client
+(`mcp.sh`, `smoke.sh`) that dials `127.0.0.1:8787` is then refused, and because
+`curl -fsS` discards a 4xx body and the harness redirects stderr, the symptom is
+"the server advertises 0 tools" — with no hint that two default names were dropped.
+
+We hit this the same day we added the name: the boundary client worked, the host
+client did not, and only probing each `Host` by hand showed why. Adding
+`["host.docker.internal", "127.0.0.1", "localhost"]` fixed it.
+
+**Suggest:** treat `allowed_hosts:` as extending the defaults (loopback always
+trusted), or, if the list is meant to replace them, say so in the reference and show
+the loopback names in every example. A keyword whose effect is "forget the safe
+defaults" should make the caller ask for that explicitly.

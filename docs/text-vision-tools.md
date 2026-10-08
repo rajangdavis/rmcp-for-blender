@@ -168,13 +168,13 @@ once the framing and contrast caveats are handled.
 
 ### Implementation, using what already exists
 
-- Put the Python in our own script file — `mcp_extras.py` beside the DSL file,
-  with `WIREFRAME = r'''...'''` / `MESH_REPORT = r'''...'''` constants — and add
-  `setting :blender_extras, env: "BLENDER_EXTRAS", default: "mcp_extras.py"`.
-- Reach them through the **existing `run_script` helper**, which already speaks
-  the addon's `ARGS` / `__MCP_RESULT__` protocol and installs the script into
-  Blender once via `sys.modules` — so a call sends a short invocation, not the
-  whole script.
+- Put the Python in `python/mcp_scripts.py`, a real module beside the DSL file
+  with `def wireframe(args)` / `def mesh_report(args)` entry points — the shape
+  every later tool in this server adopted.
+- Reach them through **`run_module`**, which reads the file from disk, installs
+  its text into `sys.modules` under a content hash, and calls one entry point by
+  name — so a call sends a short invocation rather than the whole script, and a
+  changed file installs once under a new name.
 - Bodies stay thin: build the args JSON with `Json.quote` / `Json.str_list_json`,
   call `run_script(host, port, setting(:blender_extras), "WIREFRAME", args)`, and
   return the text. `read_only: true`.
@@ -201,4 +201,3 @@ image onto a fixed 116x34 grid, so every drawing came out about 1.5x too tall �
 letterforms looked "funky", and a header that said `600x381` next to a grid of
 116x34 was quietly describing two different pictures. Same rule as the
 wireframe: one scale, or the picture lies.
-

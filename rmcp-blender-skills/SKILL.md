@@ -1,5 +1,5 @@
 ---
-name: blender-tools
+name: rmcp-blender-skills
 description: Drive the Blender MCP server built in this workspace - 29 typed tools over the mcp-for-blender addon's socket bridge. Use when making, moving, colouring, cutting, duplicating, rendering or exporting anything in Blender, when a Blender tool's report looks wrong, or when deciding which tool fits a job.
 ---
 
@@ -49,8 +49,11 @@ is worth keeping. `look` when the picture itself is the answer.
 - **Two face counts** — `array` and `modifier` report the base mesh and the
   evaluated one, because `mesh_report` and `wireframe` read the base and renders
   apply the modifiers.
-- **Bridge unreachable** — the addon's server is not listening in Blender. That
-  is a message for the user, not a retry.
+- **Bridge unreachable** — either the addon's server is not listening, or Blender
+  is busy with a long call (a big remesh or render) and the reply timed out while
+  the work went on. `ping` first. If it answers, check what the call should have
+  produced before re-running anything; see `blender-notes.md`. If it does not
+  answer, that is a message for the user, not a retry.
 
 ## Things that are deliberately absent
 
@@ -59,11 +62,17 @@ is worth keeping. `look` when the picture itself is the answer.
   `blender-notes.md`; prefer expressible inverses (re-create, re-import).
 - **No telemetry, no trajectory recording, no inline viewport app.** Images come
   back as content blocks instead.
-- **A client from another machine must present a loopback `Host`.** rmcp's
-  DNS-rebinding check refuses any other value, and `fetch` cannot set the header;
-  a sandbox needs a `node:http` or curl client (`mcp.sh` takes `MCP_HOST_HEADER`).
+- **A client across a boundary is allowed by name.** `transport :http` sets
+  `allowed_hosts: ["host.docker.internal", "127.0.0.1", "localhost"]`, so a client
+  dialling those names and sending their own `Host` is accepted (the list replaces
+  the loopback defaults, so keep them; an unlisted `Host` still gets 403); only a
+  server without `allowed_hosts:` needs a `node:http` or curl client that can
+  present a loopback `Host` (`fetch` cannot set it; `dev/mcp.sh` takes
+  `MCP_HOST_HEADER`).
 
 Depth lives in: `docs/blender-notes.md` (Blender traps; what the community
 server has that this one does not), `docs/text-vision.md` (why text instead of
 pixels), `docs/build-and-transport.md` (transport, the dev loop, and the
-compiler's gaps), `docs/editor-issues.md` (defects found in the editor).
+compiler's gaps), `docs/editor-issues.md` (defects found in the editor),
+`docs/scene-craft.md` (a prompt turned into a finished scene, every technique and
+number, with `docs/scene-craft-island.py` as the runnable build).

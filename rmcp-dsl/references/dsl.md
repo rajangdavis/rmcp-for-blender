@@ -233,8 +233,16 @@ How the server talks to a client: standard input and output (:stdio) or streamab
 
 - Allowed inside: `server`
 - Positional arguments: `kind` (one of :stdio, :http)
-- Keyword arguments: `port:` (non-negative integer literal, optional), `auth_setting:` (snake_case symbol, optional), `oauth_issuer:` (snake_case symbol, optional), `oauth_audience:` (snake_case symbol, optional), `oauth_resource:` (snake_case symbol, optional)
+- Keyword arguments: `port:` (non-negative integer literal, optional), `bind:` (string literal, optional), `allowed_hosts:` (array of string literals, optional), `allowed_origins:` (array of string literals, optional), `json_response:` (true or false, optional), `stateless:` (true or false, optional), `sse_keep_alive:` (non-negative integer literal, optional), `sse_retry:` (non-negative integer literal, optional), `max_body_bytes:` (non-negative integer literal, optional), `auth_setting:` (snake_case symbol, optional), `oauth_issuer:` (snake_case symbol, optional), `oauth_audience:` (snake_case symbol, optional), `oauth_resource:` (snake_case symbol, optional)
   - `port:` The TCP port, 0 to 65535, that `transport :http` listens on at 127.0.0.1; required for :http, refused for :stdio.
+  - `bind:` The address the HTTP server binds, such as "0.0.0.0"; the default 127.0.0.1 is loopback-only.
+  - `allowed_hosts:` Exact `Host` values the HTTP check accepts, such as ["host.docker.internal"], for a caller not on loopback.
+  - `allowed_origins:` Browser `Origin` values the HTTP server accepts, such as ["https://app.example.com"]; an entry needs a scheme; an empty list disables the check.
+  - `json_response:` True to prefer `application/json` for a simple request and response instead of an SSE stream; only for :http.
+  - `stateless:` True to serve each request without a session (stateless mode, SEP-2567); only for `transport :http`.
+  - `sse_keep_alive:` How many seconds between SSE keep-alive messages on a streaming HTTP response; only for `transport :http`.
+  - `sse_retry:` The SSE reconnect delay, in seconds, a client is told to use; only for `transport :http`.
+  - `max_body_bytes:` The largest POST request body, in bytes, the HTTP server accepts; only for `transport :http`.
   - `auth_setting:` The secret setting every request to /mcp must carry as `Authorization: Bearer ...`, or get a 401; only for :http.
   - `oauth_issuer:` The setting holding the OAuth issuer URL; every request to /mcp must carry a JWT that issuer signed (RS256 or ES256); only for :http.
   - `oauth_audience:` The setting holding the audience (`aud`) a token must have been issued for; required with `oauth_issuer:`.
@@ -270,7 +278,7 @@ Injects Rust source text into the generated crate unchecked; the compiler prints
 
 ### `rust_fn`
 
-Declares the argument and result types of a Rust function so bodies can call it as `rust(:name, ...)`.
+Declares a Rust function's argument and result types so bodies call it as `rust(:name, ...)`; the name is its name in the `from:` module.
 
 - Allowed inside: `server`
 - Positional arguments: `name` (snake_case symbol)

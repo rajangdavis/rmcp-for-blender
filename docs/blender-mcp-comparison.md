@@ -1,8 +1,8 @@
 # MCP for Blender (Python) vs the rmcp_dsl Rust server
 
 The Python server (`src/blender_mcp/server.py`) exposes ~14 MCP tools that wrap
-the addon's ~37 socket commands. The Rust server (`blender.rmcp.rb`) exposes 26
-tools: twenty-five typed tools, plus one generic `command`
+the addon's ~37 socket commands. The Rust server (`blender.rmcp.rb`) exposes 29
+tools: twenty-eight typed tools, plus one generic `command`
 tool carrying every command name as an enum and a JSON `args` string.
 
 ## Tool mapping
@@ -37,6 +37,9 @@ tool carrying every command name as an enum and a JSON `args` string.
 | `boolean` modifier | — | `boolean` | extension: difference, union or intersect against a named operand, applied or live, with a face count that shows a cut that missed |
 | — (no Python equivalent) | — | `aim` | extension: place and orient a camera to frame a target from a named side, fitting its size to the lens |
 | — (no Python equivalent) | — | `light` | extension: create or adjust a light, aimed at an object or the scene, reporting type, energy and every light in the file |
+| `subdivision`, `bevel`, `mirror`, `solidify`, `decimate`, `wireframe` modifiers | — | `modifier` | extension: add, remove or list one modifier with the setting that matters for that kind typed, reporting base and evaluated face counts |
+| — (no Python equivalent) | — | `image_report_rust` | extension: the image facts, tone grid, hue-and-strength grid, hue-ordered spectrum and a summary sentence — computed in its own Rust, so it needs no Blender session at all |
+| — (no Python equivalent) | — | `image_view` | extension: the image itself as truecolour half-blocks for a human to look at, which is what the Python server can only do with an app viewport |
 | `open_viewport` (app-only) | viewport resource | `screenshot` | the image is returned inline instead of beside the chat |
 | `viewport_latest` (app-only) | — | — | an MCP resource/UI concept, not an agent tool |
 | `record_trajectory_feedback` | trajectory/telemetry | — | intentionally out of scope |
@@ -83,9 +86,16 @@ reach through `command`: `ping`, `get_world_state_snapshot`, `bpy_api_lookup`,
   (`scene`, `materials`, `rigging`, `animation`, `retopology`, `level-design`,
   `bpy`) and a Codex plugin whose manifest carries default prompts
   (`"Add a wooden chair from Poly Pizza"`). This server's equivalent is
-  `blender-tools/SKILL.md`: the tool-by-task map, the loop that works, and the
+  `rmcp-blender-skills/SKILL.md`: the tool-by-task map, the loop that works, and the
   report signatures worth recognising — a flat grey render, `faces 499 -> 0`, a
   loose-part count, and the two face counts a modifier reports.
+- **Some of the work runs in the server, in Rust, with tests.** `textvision.rs` reads
+  an image file directly and computes the facts, the grids, the spectrum and the
+  summary; `ImageFile.size` and the socket bridge are Rust too. The difference from
+  the Python scripts is not just speed: this half needs no Blender session, so it
+  keeps working while the addon is stopped, and it carries unit tests (`cargo test`)
+  where everything reaching Blender can only be checked by calling Blender and
+  reading a report.
 - **Captures are per-call.** `look`/`screenshot` write
   `$TMPDIR/mcp-blender-<kind>-<pid>-<n>.png` and delete the file after reading,
   so concurrent callers cannot read each other's image. The Python server uses

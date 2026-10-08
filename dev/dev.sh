@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Dev loop: rebuild and restart the Blender MCP server whenever its sources change.
 #
-#   MCP_TOKEN=<token> bash dev.sh
+#   MCP_TOKEN=<token> bash dev/dev.sh
 #
 # Watches the DSL file, every binding, and the injected Rust - all of it,
 # because the compiler copies those in at build time and an edit that triggers
@@ -13,13 +13,16 @@
 # No dependencies beyond shasum (it hashes file contents, so it does not care
 # about mtimes). Linux: swap shasum for sha256sum.
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 TOKEN="${MCP_TOKEN:?set MCP_TOKEN to the token your client sends}"
+# Persist the token so a client in another shell (or a fresh login shell) can read
+# it without re-exporting: dev/mcp.sh falls back to this file. Mode 600, gitignored.
+printf %s "$TOKEN" > .mcp-token && chmod 600 .mcp-token
 BIN=./build/blender.rmcp/target/debug/blender
 PIDFILE=/tmp/mcp-server.pid
 BUILDLOG=/tmp/mcp-build.log
 SERVERLOG=/tmp/mcp-server.log
-WATCH=(blender.rmcp.rb bindings/*.rb *.rs)
+WATCH=(blender.rmcp.rb bindings/*.rb rust/*.rs)
 
 stamp() { cat "${WATCH[@]}" 2>/dev/null | shasum -a 256 | cut -c1-16; }
 stop() {
@@ -37,7 +40,7 @@ start() {
 # build directory" and then a dead port. A pidfile is not enough — a killed
 # instance leaves a stale pid and the next start sails past it — so ask the
 # process table.
-OTHERS=$(pgrep -f 'bash dev\.sh' | grep -v "^$$\$" || true)
+OTHERS=$(pgrep -f 'dev\.sh' | grep -v "^$$\$" || true)
 if [ -n "$OTHERS" ]; then
   echo "another dev.sh is already running (pid(s): $(echo $OTHERS | tr '\n' ' ')); stop it first" >&2
   exit 2

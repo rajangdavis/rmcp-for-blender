@@ -17,6 +17,8 @@ import shutil
 import uuid
 import zipfile
 import zlib
+import hmac
+import secrets
 from bpy.props import IntProperty, BoolProperty
 import io
 from datetime import datetime
@@ -1180,10 +1182,49 @@ def _object_detail(obj):
     return detail
 
 
+# --- Bridge token -----------------------------------------------------------
+# The socket below runs whatever it is sent with exec(), and Docker/Lima VMs
+# forward their host gateway to this machine's localhost, so "bound to
+# localhost" does not mean "only local processes". Every request must carry
+# this shared secret; the MCP server holds it as BLENDER_BRIDGE_TOKEN.
+_BRIDGE_TOKEN_FILE = "mcp_bridge_token"
+
+
+def _bridge_token_path():
+    return os.path.join(bpy.utils.user_resource('CONFIG'), _BRIDGE_TOKEN_FILE)
+
+
+def _load_bridge_token():
+    """The env var wins; otherwise a 0600 file in Blender's config directory,
+    created with a fresh random token the first time. Raises when neither is
+    usable, so the server never starts open."""
+    env = os.getenv("BLENDER_BRIDGE_TOKEN", "").strip()
+    if env:
+        return env
+    path = _bridge_token_path()
+    try:
+        with open(path) as f:
+            token = f.read().strip()
+        if token:
+            return token
+    except FileNotFoundError:
+        pass
+    token = secrets.token_hex(32)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    print(f"BlenderMCP: created a bridge token at {path}\n"
+          f"BlenderMCP: start the MCP server with BLENDER_BRIDGE_TOKEN=\"$(cat '{path}')\"")
+    return token
+
+
 class BlenderMCPServer:
+
     def __init__(self, host='localhost', port=9876):
         self.host = host
         self.port = port
+        self.token = None
         self.running = False
         self.socket = None
         self.server_thread = None
@@ -1275,6 +1316,10 @@ class BlenderMCPServer:
         self.running = True
 
         try:
+            # No token, no server: _load_bridge_token raises rather than
+            # returning nothing, and the except below stops cleanly.
+            self.token = _load_bridge_token()
+
             # Create socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1443,6 +1488,19 @@ class BlenderMCPServer:
                         # Try to parse command
                         command = json.loads(buffer.decode('utf-8'))
                         buffer = b''
+
+                        # Refuse anything without the bridge token, and drop
+                        # the connection: a client that does not know it gets
+                        # one error and nothing else.
+                        supplied = command.pop("token", None) if isinstance(command, dict) else None
+                        if not (isinstance(supplied, str) and self.token
+                                and hmac.compare_digest(supplied.encode(), self.token.encode())):
+                            print("BlenderMCP: refused a request without a valid bridge token")
+                            try:
+                                client.sendall(json.dumps({"status": "error", "message": "unauthorized"}).encode('utf-8'))
+                            except Exception:
+                                pass
+                            break
 
                         # Hand off to the main thread. Never call
                         # bpy.app.timers.register() from here - it is not

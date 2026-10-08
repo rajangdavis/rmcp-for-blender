@@ -13,11 +13,20 @@
 #   MCP_URL=http://host.docker.internal:8787/mcp MCP_TOKEN=... bash mcp.sh ...
 set -euo pipefail
 URL="${MCP_URL:-http://127.0.0.1:8787/mcp}"
-TOKEN="${MCP_TOKEN:?set MCP_TOKEN to the token the server was started with}"
+TOKENFILE="$(dirname "$0")/../.mcp-token"
+# The token the server was started with: from the environment, or the file dev/dev.sh writes.
+TOKEN="${MCP_TOKEN:-$(cat "$TOKENFILE" 2>/dev/null || true)}"
+TOKEN="${TOKEN:?set MCP_TOKEN, or start the server with dev/dev.sh (it writes .mcp-token)}"
+# MCP_DEBUG=1 says where the token came from and how long it is (never its value).
+if [ -n "${MCP_DEBUG:-}" ]; then
+  if [ -n "${MCP_TOKEN:-}" ]; then src="the environment"; else src="$TOKENFILE"; fi
+  printf "mcp.sh: token %s chars from %s\n" "${#TOKEN}" "$src" >&2
+fi
 HDR=(-fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json'
          -H 'Accept: application/json, text/event-stream')
-# rmcp checks the Host header (DNS-rebinding); a client reaching this server from
-# another sandbox must present a host it trusts.
+# rmcp checks the Host header (DNS-rebinding). This server allows
+# host.docker.internal (transport :http, allowed_hosts:), so a caller across a
+# sandbox needs no forgery; MCP_HOST_HEADER is for a server that has not.
 [ -n "${MCP_HOST_HEADER:-}" ] && HDR+=(-H "Host: $MCP_HOST_HEADER")
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp.sh","version":"1"}}}'
 DONE='{"jsonrpc":"2.0","method":"notifications/initialized"}'

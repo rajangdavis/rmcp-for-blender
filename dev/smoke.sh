@@ -26,6 +26,18 @@ refuses() {  # a tool that should refuse, because refusals must surface
   esac
 }
 
+echo "== token =="
+# Report which token the client will use, without printing it: the value is a
+# full-power credential, but whether it is visible is the whole question.
+if [ -n "${MCP_TOKEN:-}" ]; then
+  printf "  MCP_TOKEN from the environment (%s chars)\n" "${#MCP_TOKEN}"
+elif [ -r ../.mcp-token ]; then
+  smoke_token=$(cat ../.mcp-token)
+  printf "  MCP_TOKEN from ../.mcp-token (%s chars)\n" "${#smoke_token}"
+else
+  printf "  no MCP_TOKEN and no readable ../.mcp-token - mcp.sh will refuse\n"
+fi
+
 echo "== inventory =="
 listed=$(bash mcp.sh tools 2>/dev/null | sort | tr '\n' ' ')
 echo "  the server advertises $(printf '%s' "$listed" | wc -w) tools"

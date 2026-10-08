@@ -43,9 +43,9 @@ so it never reads stdin, and piping into it hangs.
 With the server up:
 
 ```sh
-MCP_TOKEN=$MCP_TOKEN bash mcp.sh tools
-MCP_TOKEN=$MCP_TOKEN bash mcp.sh tool scene_info '{}'
-MCP_TOKEN=$MCP_TOKEN bash mcp.sh code /tmp/probe.py   # run Python in Blender now
+MCP_TOKEN=$MCP_TOKEN bash dev/mcp.sh tools
+MCP_TOKEN=$MCP_TOKEN bash dev/mcp.sh tool scene_info '{}'
+MCP_TOKEN=$MCP_TOKEN bash dev/mcp.sh code /tmp/probe.py   # run Python in Blender now
 ```
 
 `mcp.sh tool` prints text results as text and reduces an image to
@@ -55,8 +55,8 @@ MCP_TOKEN=$MCP_TOKEN bash mcp.sh code /tmp/probe.py   # run Python in Blender no
 `smoke.sh` exercises every tool and checks the shape of each reply:
 
 ```sh
-MCP_TOKEN=$MCP_TOKEN bash smoke.sh          # hermetic: reads, refusals, error paths
-MCP_TOKEN=$MCP_TOKEN bash smoke.sh --full   # adds a probe object, then cleans up
+MCP_TOKEN=$MCP_TOKEN bash dev/smoke.sh          # hermetic: reads, refusals, error paths
+MCP_TOKEN=$MCP_TOKEN bash dev/smoke.sh --full   # adds a probe object, then cleans up
 ```
 
 Neither run calls `generate_3d`, `make_3d` or `import_asset`: they spend money or
@@ -65,10 +65,10 @@ download, and a smoke test has to be safe to run on a whim.
 ## Development loop
 
 ```sh
-MCP_TOKEN=$MCP_TOKEN bash dev.sh
+MCP_TOKEN=$MCP_TOKEN bash dev/dev.sh
 ```
 
-`dev.sh` hashes the DSL, the bindings and the Rust once a second. On a change it
+`dev/dev.sh` hashes the DSL, the bindings and the Rust once a second. On a change it
 runs `rmcp_dsl check` (fast, Ruby only), then `build`, then restarts the server
 and asks the port whether the new build is actually listening. A failed check or
 build leaves the last good build serving, so a typo never becomes a dead port for
@@ -92,7 +92,7 @@ a client mid-loop. `RAJ_NOTIFY=<key>` sends failures to an agent's mailbox.
 
 **Escape hatches** — `execute_code`, `command`
 
-`blender-tools/SKILL.md` is the agent-facing guide; the full descriptions live in
+`rmcp-blender-skills/SKILL.md` is the agent-facing guide; the full descriptions live in
 `blender.rmcp.rb`, where they are written.
 
 ## Layout
@@ -100,21 +100,21 @@ a client mid-loop. `RAJ_NOTIFY=<key>` sends failures to an agent's mailbox.
 | path | what it is |
 | --- | --- |
 | `blender.rmcp.rb` | the whole surface in the DSL: settings, params, helpers, the 29 tools, the HTTP transport |
-| `blender_bridge.rs` | the addon's socket client: one connection, one command at a time, replies read until they parse |
-| `blender_gen.rs` | helpers the DSL cannot express — `sleep_ms`, base64 image reads, Rust trim |
-| `textvision.rs` | image arithmetic — `numbers`, `grid`, `ansi` — unit-tested with `cargo test` |
+| `rust/blender_bridge.rs` | the addon's socket client: one connection, one command at a time, replies read until they parse |
+| `rust/blender_gen.rs` | helpers the DSL cannot express — `sleep_ms`, base64 image reads, Rust trim |
+| `rust/textvision.rs` | image arithmetic — `numbers`, `grid`, `ansi` — unit-tested with `cargo test` |
 | `bindings/*.rb` | crate declarations (`json`, `imagefile`) and the Rust-backed helpers they expose |
 | `python/mcp_scripts.py` | the Blender-side scripts our tools run, one function per entry point |
 | `vendor/mcp-for-blender/` | the addon, vendored |
 | `build/blender.rmcp/` | the generated crate: `src/main.rs` from the DSL, the `.rs` files copied in |
-| `dev.sh`, `mcp.sh`, `smoke.sh` | watch/restart loop, curl client, 29-tool harness |
+| `dev/dev.sh`, `dev/mcp.sh`, `dev/smoke.sh` | watch/restart loop, curl client, 29-tool harness |
 
 ## Where a change goes
 
 | you changed | save? | rebuild? |
 | --- | --- | --- |
 | `blender.rmcp.rb`, `bindings/*.rb` | yes | yes — the compiler reads disk |
-| `textvision.rs`, `blender_bridge.rs`, `blender_gen.rs` | yes | yes — copied in at build time |
+| `rust/*.rs` | yes | yes — copied in at build time |
 | `python/mcp_scripts.py` | yes | no — the server reads it per call |
 
 Per call, the server ships `python/mcp_scripts.py` to Blender once per content
@@ -154,10 +154,14 @@ the token per session, and never bind it to a shared network.
 
 ## Known limits
 
-- **The Host header.** rmcp enforces a DNS-rebinding check, so a client reaching
-  the server at `host.docker.internal` must still present `Host: 127.0.0.1:8787`.
-  `fetch` cannot set it, so use `curl -H` or `node:http`; `mcp.sh` takes
-  `MCP_HOST_HEADER`.
+- **The Host header.** rmcp enforces a DNS-rebinding check. The transport answers
+  it: `allowed_hosts:` lists the exact `Host` names trusted, and it *replaces* the
+  loopback defaults, so include them — `["host.docker.internal", "127.0.0.1", "localhost"]`.
+  A client
+  reaching the server at that name is accepted (verified: allowed `Host` -> 200, an
+  unlisted one -> 403). Only a server without `allowed_hosts:` needs a hand-written
+  client to present `Host: 127.0.0.1:8787` (`fetch` cannot set it, so use `curl -H`
+  or `node:http`; `dev/mcp.sh` takes `MCP_HOST_HEADER`).
 - **Replies are SSE**, and the first `data:` line is empty — join every `data:`
   line before parsing. `initialize` returns the session id in a response header.
 - **Generation is unproven end to end.** Tripo wants Premium, the Rodin trial key
@@ -174,4 +178,4 @@ the token per session, and never bind it to a shared network.
 - `docs/blender-notes.md` — Blender traps that cost round trips, and the tool surface against the upstream Python server
 - `docs/text-vision.md` — the text-vision design and its numbers
 - `docs/editor-issues.md` — defects found in the editor while building this
-- `blender-tools/SKILL.md` — the agent-facing guide to the tools
+- `rmcp-blender-skills/SKILL.md` — the agent-facing guide to the tools

@@ -178,8 +178,9 @@ Notifications never change the generated code or fail a build; the environment o
 is printed. Set `RMCP_DSL_WARN` or `RMCP_DSL_NOTICE` to `all`, `none` or a comma-separated list
 of codes, or pass `--warn SPEC` and `--notice SPEC`. An unknown code is an error.
 
-- `W-STR-STRIP-RUBY` (warning)
+- `N-STR-STRIP-RUBY` (notice)
 - `N-STR-STRIP-RUST` (notice)
+- `W-BINDING-UNLOADED` (warning)
 - `W-STR-CAPITALIZE` (warning)
 - `N-RUST-INJECTED` (notice)
 - `W-RUST-FN-MISSING` (warning)
