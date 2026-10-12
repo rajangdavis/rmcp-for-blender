@@ -10,15 +10,11 @@ __pycache__/
 .DS_Store
 rmcp_dsl
 .mcp-token
+# import_asset downloads land here for the length of one import, then are deleted
+downloads/
+renders/
 
-# third-party tree: only the file the server reads at runtime, plus the addon
-# whose command names and kwargs our tools encode
-vendor/*
-!vendor/mcp-for-blender/
-vendor/mcp-for-blender/*
-!vendor/mcp-for-blender/addon.py
-!vendor/mcp-for-blender/src/
-vendor/mcp-for-blender/src/*
-!vendor/mcp-for-blender/src/blender_mcp/
-vendor/mcp-for-blender/src/blender_mcp/*
-!vendor/mcp-for-blender/src/blender_mcp/blender_scripts.py
+# third-party reference trees: nothing in them is read at runtime. Blender runs
+# addon/mcp_bridge.py, and the one upstream file the server uses is copied, with
+# its license, to python/safe_mode.py.
+vendor/

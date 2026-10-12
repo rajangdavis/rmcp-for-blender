@@ -100,17 +100,9 @@ module Json
   sig { params(path: String).returns(T.nilable(String)) }
   def self.take_file_base64(path) = raise(NotImplementedError, "no Ruby stand-in")
 
-  # The text of a top-level `NAME = r'''...'''` constant in a Python file on
-  # disk; nil when the file or the constant is absent. Lets the server run the
-  # addon's own blender_scripts.py without embedding it.
-  rust "{ let mut out: Option<String> = None; let mut prefix = String::new(); for _ in 0..4 { let cand = format!(\"{}{}\", prefix, path); if let Ok(s) = std::fs::read_to_string(&cand) { let needle = format!(\"{} = r'''\", name); if let Some(i) = s.find(&needle) { let rest = &s[i + needle.len()..]; if let Some(e) = rest.find(\"'''\") { out = Some(rest[..e].to_string()); break; } } } prefix.push_str(\"../\"); } out }"
-  no_reference "reads the host filesystem"
-  sig { params(path: String, name: String).returns(T.nilable(String)) }
-  def self.py_constant(path, name) = raise(NotImplementedError, "no Ruby stand-in")
-
   # The text of a whole file on disk; nil when it cannot be read. Tries the path
-  # as given and then from up to four parent directories, exactly as py_constant
-  # does, because a setting holds a path relative to the server's own working
+  # as given and then from up to four parent directories,
+  # because a setting holds a path relative to the server's own working
   # directory. This is how our own Python module reaches Blender: as a real file
   # in the repository, read here and sent once per content hash by run_module.
   rust "{ let mut out: Option<String> = None; let mut prefix = String::new(); for _ in 0..4 { let cand = format!(\"{}{}\", prefix, path); if let Ok(s) = std::fs::read_to_string(&cand) { out = Some(s); break; } prefix.push_str(\"../\"); } out }"
@@ -130,7 +122,7 @@ module Json
   sig { params(value: Value).returns(T.nilable(String)) }
   def self.dump(value) = raise(NotImplementedError, "no Ruby stand-in")
 
-  # A short digest of a text, for cache keys: it lets run_script install a changed
+  # A short digest of a text, for cache keys: it lets run_module install a changed
   # script under a new module name instead of reusing the one Blender already has.
   rust "{ use std::hash::{Hash, Hasher}; let mut h = std::collections::hash_map::DefaultHasher::new(); text.hash(&mut h); format!(\"{:x}\", h.finish() & 0xffff_ffff) }"
   no_reference "DefaultHasher output is not stable across Rust releases; compare two runs of the server instead"

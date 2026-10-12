@@ -1,6 +1,6 @@
 ---
 name: rmcp-blender-skills
-description: Drive the Blender MCP server built in this workspace - 29 typed tools over the mcp-for-blender addon's socket bridge. Use when making, moving, colouring, cutting, duplicating, rendering or exporting anything in Blender, when a Blender tool's report looks wrong, or when deciding which tool fits a job.
+description: Drive the Blender MCP server built in this workspace - 25 typed tools over the MCP Bridge add-on's token-guarded socket. Use when making, moving, colouring, cutting, duplicating, rendering or exporting anything in Blender, when a Blender tool's report looks wrong, or when deciding which tool fits a job.
 ---
 
 # Driving this Blender server
@@ -23,17 +23,29 @@ mainly to make a failure visible instead of silent.
 | job | tools |
 |---|---|
 | see | `wireframe`, `mesh_report`, `image_report`, `image_report_rust`, `look`, `screenshot`, `reveal` |
-| make | `text`, `duplicate`, `array`, `modifier`, `boolean`, `search_assets`, `import_asset`, `generate_3d`, `make_3d` |
+| make | `text`, `duplicate`, `array`, `modifier`, `boolean` (asset libraries and 3D generation are out until they are ported to this server) |
 | place and look like something | `place`, `aim`, `material`, `light` |
-| hand over | `render` (a file on disk), `export` (glb/fbx) |
+| hand over | `render` (a still PNG), `render_animation` (a frame range to video or PNG sequence), `export` (glb/fbx) |
 | remove | `remove` |
-| escape hatches | `execute_code`, `command` |
+| escape hatch | `execute_code` (guarded: bpy, bmesh, mathutils and pure-Python helpers only; every path under the server's roots) |
 
 ## The loop that works
 
 make → place → colour → `wireframe`/`mesh_report` to check the shape and the
 measurements → `aim` → `render` → `image_report` on the file → `export` when it
 is worth keeping. `look` when the picture itself is the answer.
+
+## Seeing cheaply, and checking against the brief
+
+- **Diff the brief against the picture.** Before changing a scene, especially
+  one another agent built, write the request as a checklist. Mark each line from
+  a render, then print the data behind every miss (world bounds, parents, keys,
+  fonts). Several misses show only in the data.
+- **Crop renders** (`render.use_border` + `use_crop_to_border`) show a face or
+  the lettering at full detail for a fraction of a full frame.
+- **Strips:** render several crops (loop frames, one per candidate font), stitch
+  them with numpy into one JPEG, and look once.
+- Previews go under the repo's `renders/look/`; delete them when done.
 
 ## Report signatures worth recognising
 
@@ -49,9 +61,9 @@ is worth keeping. `look` when the picture itself is the answer.
 - **Two face counts** — `array` and `modifier` report the base mesh and the
   evaluated one, because `mesh_report` and `wireframe` read the base and renders
   apply the modifiers.
-- **Bridge unreachable** — either the addon's server is not listening, or Blender
-  is busy with a long call (a big remesh or render) and the reply timed out while
-  the work went on. `ping` first. If it answers, check what the call should have
+- **Bridge unreachable** — either the MCP Bridge add-on is not started in Blender,
+  or Blender is busy with a long call (a big remesh or render) and the reply timed
+  out while the work went on. `scene` with `limit: 1` first. If it answers, check what the call should have
   produced before re-running anything; see `blender-notes.md`. If it does not
   answer, that is a message for the user, not a retry.
 
@@ -75,4 +87,7 @@ server has that this one does not), `docs/text-vision.md` (why text instead of
 pixels), `docs/build-and-transport.md` (transport, the dev loop, and the
 compiler's gaps), `docs/editor-issues.md` (defects found in the editor),
 `docs/scene-craft.md` (a prompt turned into a finished scene, every technique and
-number, with `docs/scene-craft-island.py` as the runnable build).
+number, with `docs/scene-craft-island.py` as the runnable build), and
+`docs/scene-craft-cartoon.md` (a flat 2D cartoon in 3D: elevation camera, a
+window that never leaks sky, shader-mask fur patterns, bold CJK signage,
+seamless loops, MP4 output).

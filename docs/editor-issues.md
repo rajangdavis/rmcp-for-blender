@@ -332,3 +332,26 @@ not either once the proposal was gone.
 buttons idempotent — Withdraw on an already-withdrawn proposal should succeed and
 close rather than dead-end. An empty-directory removal should not enumerate files it
 is not removing.
+
+## 18. Memory leak on every Cmd+P
+
+Reported by the owner (2026-10-10, editor `789387ab6f073beae75814adeafde295a49dd09f`):
+"there is a memory leak every time I hit cmd + p". Each press grows the editor's
+resident memory and it does not come back down; repeated use leaks steadily.
+
+**Repro.** Press Cmd+P, dismiss, press again, repeat. Watch the editor's RSS
+(Activity Monitor, or `ps -o rss= -p <pid>`) after each press: it climbs per open
+although the view is closed again by the next press.
+
+**Why it matters.** A high-frequency binding that leaks on every invocation turns a
+gesture the user reaches for constantly into a slow failure that only shows itself
+as the session ages.
+
+**Measure before fixing (no numbers yet).** Record RSS at baseline, after 10 presses
+and after 20. A constant increment per press points at state retained per open — a
+list or model, a parsed index, a closure or a history entry — not released on close;
+a one-off climb points elsewhere.
+
+**Suggest.** Release the per-open state when the view closes, and add a check that
+opens it N times in a loop and asserts flat memory. No cause is asserted until the
+numbers exist.

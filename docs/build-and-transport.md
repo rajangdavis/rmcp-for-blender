@@ -77,25 +77,25 @@ at lint time; no bpy import, no bytecode written.
 
 ## How Python reaches Blender, and why the wire carries strings
 
-The addon's protocol has exactly one code-running verb, `execute_code`, whose
-parameter is source text. There is no run-this-file command and no file transfer, so
-a script has to travel as a string; upstream's own server ships whole script sources
-in every call, and ships its scripts twice (a copy in the addon, a copy in the
-server package) to do it. Two mechanisms use that channel.
+The add-on (`addon/mcp_bridge.py`) has exactly one code-running verb,
+`execute_code`, whose parameter is source text; its only other command is `ping`.
+There is no run-this-file command and no file transfer, so a script has to travel as
+a string. Upstream's server ships whole script sources in every call, and ships its
+scripts twice (a copy in the add-on, a copy in the server package). One mechanism
+uses that channel here.
 
-`run_script(host, port, path, NAME, args)` lifts a `NAME = r'''…'''` constant out of
-a Python file with `Json.py_constant` and runs its body as `_main()`, arguments in a
-module-global `ARGS`. It reaches one file only: upstream's `blender_scripts.py`
-(`SCENE_SUMMARY`, `LOOK`, `BOUNDS`), written in that format and not ours to
-restructure. `run_module(host, port, path, entry, args)` reads the whole file with
-`Json.read_text` and calls `entry(args)` in it as a real module; it carries
-`python/mcp_scripts.py`, every script of our own — the text-vision trio and the
-twelve scene and output tools (see `docs/text-vision.md`). `compile()` is handed the
+`run_module(host, port, path, entry, args)` reads the whole file with
+`Json.read_text` and calls `entry(args)` in it as a real module. It carries
+`python/mcp_scripts.py`, every script of our own: the text-vision trio, the scene
+and output tools, and the ports of upstream's `SCENE_SUMMARY`, `LOOK` and `BOUNDS`
+(`scene_summary`, `look`, `bounds`), which used to be lifted out of the vendored
+`blender_scripts.py` by a second mechanism, `run_script`, now gone. It also carries
+`python/mcp_guard.py` and `python/safe_mode.py` (upstream's validator, copied unmodified) for `execute_code`. `compile()` is handed the
 file's own path, so a traceback names a line there instead of in a generated string,
 and the file can be linted, imported and run alone:
 `blender --background --python python/mcp_scripts.py -- reveal '{}'`.
 
-Both install into `sys.modules` under a hash of the text and answer
+Each file installs into `sys.modules` under a hash of its text and answer
 `__MCP_NEED_INSTALL__` when Blender has not seen that text, so the first call in a
 session pays one extra round trip and every later call sends a few hundred bytes.
 The rule for new tools: prefer `run_module`, and write real Python returning a dict

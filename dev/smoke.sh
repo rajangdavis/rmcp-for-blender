@@ -4,8 +4,8 @@
 #   MCP_TOKEN=… bash smoke.sh          hermetic: inventory, read-only tools, error paths
 #   MCP_TOKEN=… bash smoke.sh --full   also makes a probe, changes it, cleans up
 #
-# `generate_3d`, `make_3d` and `import_asset` are never called: they spend money or
-# download, and a smoke test has to be safe to run on a whim.
+# Nothing here spends money or downloads an asset, so it is safe to run on a whim;
+# the one network call is a Poly Haven search, which needs no account.
 set -uo pipefail
 cd "$(dirname "$0")"
 FULL=0; [ "${1:-}" = "--full" ] && FULL=1
@@ -42,18 +42,18 @@ echo "== inventory =="
 listed=$(bash mcp.sh tools 2>/dev/null | sort | tr '\n' ' ')
 echo "  the server advertises $(printf '%s' "$listed" | wc -w) tools"
 for want in scene scene_info reveal text place material remove duplicate array boolean aim light \
-            modifier render export wireframe mesh_report image_report look screenshot command \
-            execute_code object_info search_assets import_asset generate_3d make_3d image_report_rust image_view; do
+            modifier render render_animation export wireframe mesh_report image_report look screenshot \
+            execute_code object_info image_report_rust image_view search_assets import_asset; do
   case " $listed " in *" $want "*) ;; *) printf '  %-14s FAIL  not advertised\n' "$want"; fail=$((fail+1));; esac
 done
-[ $fail -eq 0 ] && echo "  all 29 present"
+[ $fail -eq 0 ] && echo "  all 27 present"
 
 echo "== preflight: is anything answering in Blender? =="
-if bash mcp.sh tool command '{"name":"ping"}' 2>/dev/null | grep -q result; then
-  echo "  the addon answers"
+if bash mcp.sh tool scene '{"limit":1}' 2>/dev/null | grep -q items; then
+  echo "  the MCP Bridge add-on answers"
 else
-  echo "  the addon's server is not answering in Blender: start it in Blender and re-run." >&2
-  echo "  (checked with command ping; nothing else was called)" >&2
+  echo "  the MCP Bridge add-on is not answering: start it in Blender's sidebar (N > MCP) and re-run." >&2
+  echo "  (checked with scene; nothing else was called)" >&2
   exit 2
 fi
 
@@ -62,20 +62,60 @@ expect reveal '{}' '"report"'
 expect reveal '{"name":"definitely-not-here"}' 'no object named'
 expect scene '{"limit":3}' 'items'
 expect scene_info '{}' 'data'
-expect command '{"name":"ping"}' 'result'
-expect execute_code '{"code":"print(1)"}' '1'
-expect image_report '{"source":"definitely-not-here.png"}' 'cannot load'
+# BLENDER_CODE_POLICY decides what execute_code does: guarded (the default),
+# open or off. Probe which one this server runs, since the checks differ.
+code_out=$(bash mcp.sh tool execute_code '{"code":"import os\nprint(\"OPEN\")"}' 2>&1 | head -3 | tr '\n' ' ')
+case "$code_out" in
+  *"execute_code is off"*)     code_mode=off ;;
+  *OPEN*)                      code_mode=open ;;
+  *"refused by the validator"*) code_mode=guarded ;;
+  *)                           code_mode=unknown ;;
+esac
+if [ "$code_mode" = unknown ]; then
+  printf '  %-14s FAIL  could not tell the code policy: %s\n' execute_code "$(printf '%s' "$code_out" | cut -c1-62)"; fail=$((fail+1))
+else
+  printf '  %-14s ok    BLENDER_CODE_POLICY is %s\n' execute_code "$code_mode"; pass=$((pass+1))
+fi
+if [ "$code_mode" = guarded ] || [ "$code_mode" = open ]; then
+  expect execute_code '{"code":"print(1 + 1)"}' '2'
+fi
+if [ "$code_mode" = guarded ]; then
+  echo "== the guard around execute_code =="
+  refuses execute_code '{"code":"import subprocess"}'
+  refuses execute_code '{"code":"open(\"/etc/hosts\").read()"}'
+  refuses execute_code '{"code":"import bpy\nprint(bpy.path.module_names(\"/\"))"}'
+  refuses execute_code '{"code":"import bpy\nbpy.data.images.load(\"/etc/hosts\")"}'
+  refuses execute_code '{"code":"import bpy\nbpy.context.scene.render.filepath = \"/tmp/mcp-smoke-outside\""}'
+  refuses execute_code '{"code":"import bpy\nbpy.ops.wm.save_mainfile()"}'
+  refuses execute_code '{"code":"import bpy\nsave = bpy.ops.wm.save_as_mainfile"}'
+fi
+expect image_report '{"source":"definitely-not-here.png"}' 'no image named'
+expect search_assets '{"source":"polyhaven","query":"brick","asset_type":"textures","limit":2}' 'total_count'
+refuses search_assets '{"source":"polypizza"}'
+
+echo "== the file roots: paths outside them =="
+refuses image_view '{"source":"/etc/hosts"}'
+refuses image_report_rust '{"source":"/etc/hosts"}'
+refuses image_report '{"source":"/etc/hosts"}'
+refuses look '{"mode":"image","image":"/etc/hosts"}'
+refuses render '{"file":"/tmp/mcp-smoke-outside.png"}'
+refuses render '{"file":"../mcp-smoke-outside.png"}'
+refuses export '{"file":"~/mcp-smoke-outside.glb"}'
 expect look '{"mode":"viewport","max_size":200}' '[image'
 expect screenshot '{"max_size":200}' '[image'
 refuses object_info '{"name":"definitely-not-here"}'
 # wireframe and mesh_report are Python entry points, and every one of those
 # reports a miss as text ("no mesh object named X") rather than failing the call;
-# only the addon's native commands come back as errors. Check the message, not the
+# object_info is the one that fails the call on a miss. Check the message, not the
 # shape, so the smoke does not pin a convention the module does not hold.
 expect wireframe '{"name":"definitely-not-here"}' 'no mesh object named'
 expect mesh_report '{"name":"definitely-not-here"}' 'no mesh object named'
 
-if [ $FULL -eq 1 ]; then
+if [ $FULL -eq 1 ] && { [ "$code_mode" = off ] || [ "$code_mode" = unknown ]; }; then
+  echo "== full: skipped =="
+  echo "  --full records and restores the camera and lights with execute_code, which is"
+  echo "  off on this server (BLENDER_CODE_POLICY=off); guarded or open runs the full pass."
+elif [ $FULL -eq 1 ]; then
   echo "== full: one probe, changed and cleaned up =="
   expect text '{"text":"SMOKE","name":"smoke_probe","size":0.25,"z":1.0}' 'converted to MESH'
   expect wireframe '{"name":"smoke_probe","views":["top"],"width":64,"height":20}' 'wireframe v2'
@@ -123,11 +163,16 @@ if [ $FULL -eq 1 ]; then
     expect execute_code "$(jq -nc --arg b "$lights_before" '{code:("import bpy, json; keep = json.loads(" + ($b|@json) + "); gone = []; [gone.append(o.name) or bpy.data.objects.remove(o, do_unlink=True) for o in list(bpy.data.objects) if o.type == \"LIGHT\" and o.name not in keep]; print(\"removed %d light(s)\" % len(gone))")}')" 'removed 1 light'
   fi
 
-  # render and export write real files: delete both rather than leave litter
-  # beside the .blend for the user to find later.
+  # render and export write real files under the write roots: delete both rather
+  # than leave litter. Guarded code may not touch os, so the shell does it; the
+  # smoke runs beside the server, where those paths are.
   for leftover in "$png" "$glb"; do
     if [ -n "$leftover" ]; then
-      expect execute_code "$(jq -nc --arg p "$leftover" '{code:("import os; p = " + ($p|@json) + "; os.path.exists(p) and os.remove(p); print(\"removed\")")}')" removed
+      if rm -f "$leftover" 2>/dev/null && [ ! -e "$leftover" ]; then
+        printf '  %-14s ok    removed %s\n' cleanup "$(basename "$leftover")"; pass=$((pass+1))
+      else
+        printf '  %-14s FAIL  could not remove %s\n' cleanup "$leftover"; fail=$((fail+1))
+      fi
     fi
   done
 

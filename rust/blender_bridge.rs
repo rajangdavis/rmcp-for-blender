@@ -5,21 +5,49 @@
 //! read until it parses. The connection is kept, as the Python MCP server keeps
 //! one; it is dropped when its write fails or a reply cannot be parsed, and a
 //! request that was written is never sent twice.
+//!
+//! Every call waits under its own read timeout. A timeout is reported as its own
+//! JSON result (`{"status":"timeout", ...}`), not the empty string, because a
+//! timed-out command may still be running in Blender: the caller has to verify
+//! before retrying, and it must not be told the bridge was unreachable when it
+//! was merely slow. The empty string still means "no reply" -- unreachable or
+//! closed -- so the two failures stay distinguishable.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How long a call waits for its reply when the caller does not say. Long
+/// operations pass their own: a Cycles still takes 18-27 s, and an animation or
+/// an import can take minutes.
+const DEFAULT_TIMEOUT_SECS: i64 = 60;
+
+/// How long the follow-up ping waits when a call times out. It answers at once
+/// when Blender is idle, and does not answer while a command still holds the
+/// main thread, which is exactly what the ping is there to learn.
+const PING_TIMEOUT_SECS: u64 = 5;
 
 static CONN: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
 
-/// Read one complete JSON reply; None when the peer closes, errors, or sends
-/// something that never parses.
+/// What reading one reply ended in. TimedOut is kept apart from Closed: a
+/// timeout leaves a command that was written and may still have run, while a
+/// closed or unparsable connection means the reply is simply gone.
+enum ReadOutcome {
+    Reply(serde_json::Value),
+    TimedOut,
+    Closed,
+}
+
+/// Read one complete JSON reply; Closed when the peer closes, errors, or sends
+/// something that never parses; TimedOut when the read blocks past the stream's
+/// read timeout with the reply still incomplete.
 ///
 /// The bytes are scanned once as they arrive, tracking string and bracket
 /// depth, and parsed a single time when the top-level value closes. Parsing the
 /// whole buffer after every chunk cost about n * n / chunk bytes of parsing for
 /// an n-byte reply, which dominated replies carrying base64 images.
-fn read_reply(stream: &mut TcpStream) -> Option<serde_json::Value> {
+fn read_reply(stream: &mut TcpStream) -> ReadOutcome {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 65536];
     let mut depth: usize = 0;
@@ -28,8 +56,12 @@ fn read_reply(stream: &mut TcpStream) -> Option<serde_json::Value> {
     let mut escaped = false;
     loop {
         let n = match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                return ReadOutcome::TimedOut
+            }
+            Err(_) => break,
         };
         let start = buf.len();
         buf.extend_from_slice(&chunk[..n]);
@@ -54,14 +86,20 @@ fn read_reply(stream: &mut TcpStream) -> Option<serde_json::Value> {
                 b'}' | b']' => {
                     depth = depth.saturating_sub(1);
                     if started && depth == 0 {
-                        return serde_json::from_slice::<serde_json::Value>(&buf[..=i]).ok();
+                        return match serde_json::from_slice::<serde_json::Value>(&buf[..=i]) {
+                            Ok(value) => ReadOutcome::Reply(value),
+                            Err(_) => ReadOutcome::Closed,
+                        };
                     }
                 }
                 _ => {}
             }
         }
     }
-    serde_json::from_slice::<serde_json::Value>(&buf).ok()
+    match serde_json::from_slice::<serde_json::Value>(&buf) {
+        Ok(value) => ReadOutcome::Reply(value),
+        Err(_) => ReadOutcome::Closed,
+    }
 }
 
 /// The bridge token, read once from BLENDER_BRIDGE_TOKEN. It is read here
@@ -88,13 +126,76 @@ fn with_token(request: &str, token: &str) -> Option<String> {
     Some(value.to_string())
 }
 
-/// Send one command to the addon and return its reply as JSON text.
+/// The synthetic reply a timed-out call returns. It is JSON text with a status
+/// of its own, so a caller that already branches on `/status` sees "timeout"
+/// instead of "success", reads `/message`, and knows the command may have run.
+/// `answered` says whether a fresh-connection ping reached Blender afterwards.
+fn timeout_reply(timeout_secs: i64, answered: bool) -> String {
+    let message = if answered {
+        format!(
+            "timed out after {} s -- the operation may still have run in Blender; verify before retrying (the command was NOT resent). A follow-up ping answered, so Blender is reachable",
+            timeout_secs
+        )
+    } else {
+        format!(
+            "timed out after {} s -- the operation may still have run in Blender; verify before retrying (the command was NOT resent). A follow-up ping did not answer: Blender is busy or unreachable",
+            timeout_secs
+        )
+    };
+    let mut object = serde_json::Map::new();
+    object.insert("status".to_string(), serde_json::Value::String("timeout".to_string()));
+    object.insert("message".to_string(), serde_json::Value::String(message));
+    object.insert("blender_answered".to_string(), serde_json::Value::Bool(answered));
+    serde_json::Value::Object(object).to_string()
+}
+
+/// Ask the addon, on a fresh connection, whether it is still there. A new,
+/// read-only `ping`: it is never a resend of the command that timed out. It
+/// carries the same token as every other request.
+fn ping_after_timeout(host: &str, port: i64) -> bool {
+    let request = match with_token("{\"type\":\"ping\"}", bridge_token()) {
+        Some(request) => request,
+        None => return false,
+    };
+    let mut stream = match TcpStream::connect(format!("{}:{}", host, port)) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(PING_TIMEOUT_SECS)));
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    matches!(
+        read_reply(&mut stream),
+        ReadOutcome::Reply(value) if value.get("status").and_then(|s| s.as_str()) == Some("success")
+    )
+}
+
+/// Send one command to the addon and return its reply as JSON text, waiting the
+/// default timeout. Kept as the three-argument call every existing helper uses.
+pub fn blender_call(host: impl AsRef<str>, port: i64, request: impl AsRef<str>) -> String {
+    blender_call_timeout(host, port, request, DEFAULT_TIMEOUT_SECS)
+}
+
+/// Send one command to the addon and return its reply as JSON text, waiting up
+/// to `timeout_secs` for it (clamped to 1..86400).
 ///
 /// The empty string means "no reply": the addon is not listening, the kept
-/// connection died, or the reply never parsed. A command that was written is
-/// not retried on a new connection, so a command runs at most once. A request
-/// that cannot carry the token is never sent.
-pub fn blender_call(host: impl AsRef<str>, port: i64, request: impl AsRef<str>) -> String {
+/// connection died, or the reply never parsed. A timeout returns a distinct
+/// JSON object whose status is "timeout" instead, so "may still be running" is
+/// not confused with "unreachable". A command that was written is not retried
+/// on a new connection, so a command runs at most once; the follow-up ping is a
+/// new request, not a resend. A request that cannot carry the token is never
+/// sent.
+pub fn blender_call_timeout(
+    host: impl AsRef<str>,
+    port: i64,
+    request: impl AsRef<str>,
+    timeout_secs: i64,
+) -> String {
+    let host = host.as_ref();
+    let timeout_secs = timeout_secs.clamp(1, 86_400);
+    let timeout = Duration::from_secs(timeout_secs as u64);
     let request = match with_token(request.as_ref(), bridge_token()) {
         Some(request) => request,
         None => return String::new(),
@@ -106,15 +207,21 @@ pub fn blender_call(host: impl AsRef<str>, port: i64, request: impl AsRef<str>) 
         Err(poisoned) => poisoned.into_inner(),
     };
 
+    let started = Instant::now();
     let mut out: Option<serde_json::Value> = None;
     let mut sent = false;
+    let mut timed_out = false;
     let mut dead = false;
 
     if let Some(stream) = guard.as_mut() {
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        let _ = stream.set_read_timeout(Some(timeout));
         if stream.write_all(request.as_bytes()).is_ok() {
             sent = true;
-            out = read_reply(stream);
+            match read_reply(stream) {
+                ReadOutcome::Reply(value) => out = Some(value),
+                ReadOutcome::TimedOut => timed_out = true,
+                ReadOutcome::Closed => {}
+            }
         } else {
             dead = true;
         }
@@ -124,11 +231,17 @@ pub fn blender_call(host: impl AsRef<str>, port: i64, request: impl AsRef<str>) 
     }
 
     if out.is_none() && !sent {
-        if let Ok(mut stream) = TcpStream::connect(format!("{}:{}", host.as_ref(), port)) {
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+        if let Ok(mut stream) = TcpStream::connect(format!("{}:{}", host, port)) {
+            let _ = stream.set_read_timeout(Some(timeout));
             if stream.write_all(request.as_bytes()).is_ok() {
-                out = read_reply(&mut stream);
-                *guard = Some(stream);
+                match read_reply(&mut stream) {
+                    ReadOutcome::Reply(value) => {
+                        out = Some(value);
+                        *guard = Some(stream);
+                    }
+                    ReadOutcome::TimedOut => timed_out = true,
+                    ReadOutcome::Closed => {}
+                }
             }
         }
     }
@@ -136,5 +249,34 @@ pub fn blender_call(host: impl AsRef<str>, port: i64, request: impl AsRef<str>) 
         *guard = None;
     }
 
-    out.map(|value| value.to_string()).unwrap_or_default()
+    // A timeout can mean the command is still running on Blender's main thread.
+    // Ask, on a fresh connection, whether the addon answers at all; a ping is a
+    // new request, never a resend of the one that timed out.
+    let answered = timed_out && ping_after_timeout(host, port);
+
+    let outcome = if out.is_some() {
+        "reply"
+    } else if timed_out {
+        "timeout"
+    } else {
+        "no-reply"
+    };
+    eprintln!(
+        "blender_call {}:{} {} in {} ms ({} bytes sent, timeout {} s, blender_answered={})",
+        host,
+        port,
+        outcome,
+        started.elapsed().as_millis(),
+        request.len(),
+        timeout_secs,
+        answered
+    );
+
+    if let Some(value) = out {
+        value.to_string()
+    } else if timed_out {
+        timeout_reply(timeout_secs, answered)
+    } else {
+        String::new()
+    }
 }

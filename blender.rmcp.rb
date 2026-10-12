@@ -1,34 +1,18 @@
 # typed: true
-server "blender", version: "0.1.0", instructions: "MCP for Blender drives the user's live Blender. execute_code runs Python there with the full bpy API, so anything Blender can do, you can do; screenshot and look show you the result.\n\nStart with command(name: \"get_addon_info\") (Blender version, which libraries and generators are on) and scene_info.\n\nScripts run in someone else's Blender:\n- Look shader nodes up by type, never by name (names are localized): next(n for n in mat.node_tree.nodes if n.type == \"BSDF_PRINCIPLED\").\n- Never hardcode enum identifiers; read them, for example [i.identifier for i in bpy.types.RenderSettings.bl_rna.properties[\"file_format\"].enum_items]. scene.render.engine under-reports: read the current value, and assign a new one inside try/except TypeError, whose message lists the valid engines.\n- Material colors go on shader node inputs; material.diffuse_color only affects the viewport.\n\nlook is how you see your work; use it as much as you need. Images stay in the conversation, so a smaller max_size keeps long sessions cheap.\n\nObjects can also come from existing libraries (search_assets, then import_asset: Poly Haven, Sketchfab, Poly Pizza) or be made to order (generate_3d: one new textured model from text or an image, 1-3 minutes, may cost the user a credit). A generation is one object, never a whole scene, the ground or parts to assemble. Imported and generated models arrive at arbitrary scale: use the reported world_bounding_box to size them and put them on the ground." do
+server "blender", version: "0.2.0", instructions: "MCP for Blender drives the user's live Blender. The typed tools cover the everyday work; screenshot and look show you the result. execute_code runs Python there with the bpy API, guarded: import only bpy, bmesh, mathutils and pure-Python helpers (no os, open, subprocess, sockets or numpy), and every file path you hand Blender must sit under the server's roots. Write under BLENDER_WRITE_ROOTS (by default the directory the server runs in; a relative path lands under the first), read under those or BLENDER_READ_ROOTS. A refusal names the line and the rule; rewrite the script rather than working around it, and use render and export for output files.\n\nStart with scene_info.\n\nScripts run in someone else's Blender:\n- Look shader nodes up by type, never by name (names are localized): next(n for n in mat.node_tree.nodes if n.type == \"BSDF_PRINCIPLED\").\n- Never hardcode enum identifiers; read them, for example [i.identifier for i in bpy.types.RenderSettings.bl_rna.properties[\"file_format\"].enum_items]. scene.render.engine under-reports: read the current value, and assign a new one inside try/except TypeError, whose message lists the valid engines.\n- Material colors go on shader node inputs; material.diffuse_color only affects the viewport.\n\nlook is how you see your work; use it as much as you need. Images stay in the conversation, so a smaller max_size keeps long sessions cheap.\n\nObjects, materials and lighting can also come from existing libraries: search_assets, then import_asset (Poly Haven needs no account; Sketchfab and Poly Pizza need the user's API keys on this server). Imported models arrive at arbitrary scale: pass target_size, or use the reported world_bounding_box to size them, and put them on the ground." do
   use_bindings :json
   use_bindings :imagefile
 
-  # The addon bridge lives in hand-written Rust beside this file: one persistent
-  # connection, one command at a time, the reply back as JSON text.
+  # The bridge to Blender lives in hand-written Rust beside this file: one
+  # persistent connection to the MCP Bridge add-on (addon/mcp_bridge.py), one
+  # command at a time, the reply back as JSON text.
   rust_file "rust/blender_bridge.rs", as: :blender_bridge
   rust_fn :blender_call, args: [:string, :i64, :string], returns: :string, from: :blender_bridge
-
-  # Ruby's strip and Rust's trim() agree on the text these tools handle (script
-  # source, captured stdout, user-supplied names), and calling Rust's own trim
-  # keeps the generated code idiomatic: every Ruby .strip otherwise compiles to an
-  # explicit-set trim and earns a W-STR-STRIP-RUBY warning.
-  #
-  # The generation helpers below need three things the DSL cannot express itself:
-  # a sleep between poll attempts (the DSL has no sleep, and the poll loop must
-  # not spin), an image read as base64 and an extension for Hyper3D Rodin's
-  # main-site request (it takes the bytes rather than a path), and Rust's trim
-  # for the shared script installer. They live in blender_gen.rs beside the
-  # bridge and are declared with rust_fn from: :blender_gen, so rustc checks
-  # them as a file rather than as an inline string, and every Ruby .strip stays
-  # warning-free. sleep_ms is async: a body that calls it (gen_wait) is compiled
-  # async too, and the tool bodies that reach it (generate_3d, make_3d) await the
-  # whole chain; the DSL infers that from the call, so no helper declares async.
-  # base64 is already a binding crate, so blender_gen.rs may use it too.
-  rust_file "rust/blender_gen.rs", as: :blender_gen
-  rust_fn :sleep_ms, args: [:i64], returns: :i64, async: true, from: :blender_gen
-  rust_fn :gen_file_base64, args: [:string], returns: :string, from: :blender_gen
-  rust_fn :gen_path_suffix, args: [:string], returns: :string, from: :blender_gen
-  rust_fn :trim_text, args: [:string], returns: :string, from: :blender_gen
+  # The same call with the caller's own read timeout in seconds, for an operation
+  # that legitimately outlives the default (a render, an animation, an import).
+  # A timeout returns {"status":"timeout",...}, not the empty string that means
+  # "unreachable", so a caller can tell "may still be running" from "no reply".
+  rust_fn :blender_call_timeout, args: [:string, :i64, :string, :i64], returns: :string, from: :blender_bridge
 
   # Reading an image as text, but in Rust rather than inside Blender: the
   # arithmetic is unit-testable with cargo test and needs no Blender session.
@@ -38,50 +22,59 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   rust_fn :grid, args: [:string, :i32], returns: :string, from: :textvision
   rust_fn :ansi, args: [:string, :i32, :string, :string], returns: :string, from: :textvision
 
+  # The path jail: every file path a tool takes is resolved in Rust, symlinks
+  # followed, and refused unless it sits under a file root. canonicalize is
+  # filesystem work the DSL cannot express, and the check has to see the path
+  # as the OS will, not as the agent wrote it.
+  rust_file "rust/blender_jail.rs", as: :blender_jail
+  rust_fn :jail_path, args: [:string, :string, :string, :string], returns: :string, from: :blender_jail
+  rust_fn :jail_roots, args: [:string], returns: :string, from: :blender_jail
+
+  # The asset libraries (Poly Haven, Sketchfab, Poly Pizza): every network call
+  # and download happens in this server, with the API keys from its environment
+  # (BLENDERMCP_SKETCHFAB_API_KEY, BLENDERMCP_POLYPIZZA_API_KEY), and Blender only
+  # imports files already on disk, through import_asset in python/mcp_scripts.py.
+  rust_file "rust/blender_assets.rs", as: :blender_assets
+  rust_fn :asset_search, args: [:string, :string, :string, :string, :string, :f64, :bool, :i64], returns: :string, from: :blender_assets
+  rust_fn :asset_fetch, args: [:string, :string, :string, :string, :string, :string], returns: :string, from: :blender_assets
+
   setting :blender_host, env: "BLENDER_HOST", default: "localhost", description: "host of the Blender addon bridge"
   setting :blender_port, env: "BLENDER_PORT", default: "9876", description: "port of the Blender addon bridge"
-  setting :blender_scripts, env: "BLENDER_SCRIPTS", default: "vendor/mcp-for-blender/src/blender_mcp/blender_scripts.py", description: "path to the addon's blender_scripts.py, whose scripts this server runs inside Blender"
+  setting :write_roots, env: "BLENDER_WRITE_ROOTS", default: ".", description: "directories where tools and execute_code may write, and read; a list like PATH (':' between entries, ';' on Windows). A relative path lands under the first, and outputs default to its renders and exports folders. The default is the directory this server runs in"
+  setting :read_roots, env: "BLENDER_READ_ROOTS", default: "", description: "extra directories tools and execute_code may read but not write, such as a texture library or the system fonts; a list like PATH. Empty by default"
+  setting :code_policy, env: "BLENDER_CODE_POLICY", default: "guarded", description: "how execute_code runs: guarded (the default) checks the code with upstream's validator, then runs it with every file path held to the roots and no processes, network or native code; open runs it unchecked, as the user, with the whole filesystem in reach; off refuses it"
   setting :mcp_token, env: "MCP_TOKEN", secret: true, description: "bearer token every request to the HTTP transport must carry; required, so every run needs MCP_TOKEN set"
   setting :blender_python, env: "BLENDER_PYTHON", default: "python/mcp_scripts.py", description: "path to the Python module the scene and output tools run: a real module, read here and installed into Blender once per content hash"
 
   # One command over the bridge: send, check the addon's status, and return the
   # result as JSON text (helpers cannot carry an opaque Json::Value).
   helper :blender_request, args: [:string, :i64, :string], returns: :string do |host, port, request|
-    resp = Json.parse(rust(:blender_call, host, port, request)) || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")
+    resp = Json.parse(rust(:blender_call, host, port, request)) || raise("Blender bridge unreachable: start the MCP Bridge add-on (addon/mcp_bridge.py) in Blender's sidebar, and give this server its token as BLENDER_BRIDGE_TOKEN")
     status = Json.text(resp, "/status") || "error"
     raise (Json.text(resp, "/message") || "Blender returned an error") unless status == "success"
     Json.dump(Json.at(resp, "/result") || raise("the bridge returned no result")) || raise("could not encode the result")
   end
 
-  # Run one of the addon's bundled blender_scripts.py scripts inside Blender via
-  # execute_code, using its ARGS/RESULT_MARKER protocol, and return the JSON text
-  # the script produced. The script is installed into Blender's session once and
-  # then only named: the first call for a script sends its source, later calls
-  # send a short invocation, so a long session does not resend the source.
-  helper :run_script, args: [:string, :i64, :string, :string, :string], returns: :string do |host, port, scripts, name, arguments|
-    script = Json.py_constant(scripts, name) || raise("#{name} not found in #{scripts}")
-    qargs = Json.quote(arguments)
-    qmodule = Json.quote("_mcp_scripts_#{name}_#{Json.short_hash(script)}")
-    indented = rust(:trim_text, script).gsub(/\n/, "\n    ")
-    source = "import json as _json\ndef _main():\n    #{indented}\n"
-    qsource = Json.quote(source)
-    invoke = "import sys, json as _json\nmod = sys.modules.get(#{qmodule})\nif mod is None:\n    print('__MCP_NEED_INSTALL__')\nelse:\n    mod.ARGS = _json.loads(#{qargs})\n    print('__MCP_RESULT__' + _json.dumps(mod._main()))\n"
-    install = "import sys, types, json as _json\nmod = sys.modules.get(#{qmodule})\nif mod is None:\n    mod = types.ModuleType(#{qmodule})\n    exec(compile(#{qsource}, '<mcp_scripts>', 'exec'), mod.__dict__)\n    sys.modules[#{qmodule}] = mod\nmod.ARGS = _json.loads(#{qargs})\nprint('__MCP_RESULT__' + _json.dumps(mod._main()))\n"
-    invoke_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(invoke)}}}"
-    install_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(install)}}}"
-    raw = Json.parse(rust(:blender_call, host, port, invoke_request))
-    resp = raw || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")
-    status = Json.text(resp, "/status") || "error"
-    stdout = Json.text(resp, "/result/result") || ""
-    cold = if rust(:trim_text, stdout) == "__MCP_NEED_INSTALL__" then true else false end
-    # A cold Blender has not seen this script yet: installing it and running it
-    # in one more command costs a round trip once, and every later call sends
-    # only the short invocation above.
-    retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")) else resp end
-    retry_status = if cold then (Json.text(retry_resp, "/status") || "error") else status end
-    retry_stdout = if cold then (Json.text(retry_resp, "/result/result") || "") else stdout end
-    raise (Json.text(retry_resp, "/message") || "Blender returned an error") unless retry_status == "success"
-    retry_stdout.split("__MCP_RESULT__").last || raise("the script finished without a result")
+  # A path a tool was given, resolved under the file roots; a refusal is raised
+  # as the jail worded it.
+  helper :jail, args: [:string, :string, :string, :string], returns: :string do |path, write_roots, read_roots, mode|
+    resolved = rust(:jail_path, path, write_roots, read_roots, mode)
+    raise resolved if resolved.start_with?("refused:")
+    resolved
+  end
+
+  # An image a tool takes by name or by path. A name has no slash and goes to
+  # Blender as is, which only looks it up among the file's images; anything with
+  # a slash, or a ~, is a path and goes through the jail.
+  helper :image_ref, args: [:string, :string, :string], returns: :string do |name_or_path, write_roots, read_roots|
+    if name_or_path.include?("/") || name_or_path.start_with?("~") then jail(name_or_path, write_roots, read_roots, "read") else name_or_path end
+  end
+
+  # The roots as a JSON list of resolved directories, for Blender: the guard
+  # around execute_code compares against exactly the directories the jail does.
+  helper :roots_json, args: [:string], returns: :string do |list|
+    resolved = rust(:jail_roots, list)
+    Json.str_list_json(resolved.split("\n"))
   end
 
   # Run one entry point in our own Python module: a real file in the repository,
@@ -91,7 +84,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   # call. compile() is handed the file's own path, so a traceback out of Blender
   # names a line in that file instead of a generated string. Each entry point
   # takes the tool's arguments as a dict and returns a dict whose "report" is the
-  # text. Upstream's own blender_scripts.py constants keep using run_script.
+  # text.
   helper :run_module, args: [:string, :i64, :string, :string, :string], returns: :string do |host, port, path, entry, arguments|
     module_source = Json.read_text(path) || raise("#{path} not found: the Python module these tools run lives there")
     qargs = Json.quote(arguments)
@@ -105,377 +98,67 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     invoke_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(invoke)}}}"
     install_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(install)}}}"
     raw = Json.parse(rust(:blender_call, host, port, invoke_request))
-    resp = raw || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")
+    resp = raw || raise("Blender bridge unreachable: start the MCP Bridge add-on (addon/mcp_bridge.py) in Blender's sidebar, and give this server its token as BLENDER_BRIDGE_TOKEN")
     status = Json.text(resp, "/status") || "error"
     stdout = Json.text(resp, "/result/result") || ""
-    cold = if rust(:trim_text, stdout) == "__MCP_NEED_INSTALL__" then true else false end
-    retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable: start the addon's server in Blender, and give this server the addon's token as BLENDER_BRIDGE_TOKEN")) else resp end
+    cold = if Rust::Str(stdout).trim.to_s == "__MCP_NEED_INSTALL__" then true else false end
+    retry_resp = if cold then (Json.parse(rust(:blender_call, host, port, install_request)) || raise("Blender bridge unreachable: start the MCP Bridge add-on (addon/mcp_bridge.py) in Blender's sidebar, and give this server its token as BLENDER_BRIDGE_TOKEN")) else resp end
     retry_status = if cold then (Json.text(retry_resp, "/status") || "error") else status end
     retry_stdout = if cold then (Json.text(retry_resp, "/result/result") || "") else stdout end
     raise (Json.text(retry_resp, "/message") || "Blender returned an error") unless retry_status == "success"
     retry_stdout.split("__MCP_RESULT__").last || raise("the script finished without a result")
   end
 
-  # The native viewport capture: the addon's own screenshot command, which
-  # needs no open 3D viewport area. Returns the PNG as base64.
-  helper :viewport_png, args: [:string, :i64, :i32], returns: :string do |host, port, max_size|
-    path = Json.temp_png("viewport")
-    request = "{\"type\":\"get_viewport_screenshot\",\"params\":{\"max_size\":#{max_size},\"filepath\":#{Json.quote(path)}}}"
-    value = Json.parse(blender_request(host, port, request)) || raise("could not parse the screenshot result")
-    problem = Json.text(value, "/error") || ""
-    raise problem unless problem == ""
-    Json.take_file_base64(path) || raise("could not read the screenshot file")
+  # run_module with the caller's own bridge timeout in seconds: the same call,
+  # willing to wait as long as the operation needs. A timeout on a long render is
+  # the failure this exists to prevent, and it is threaded by hand because the
+  # DSL has no default arguments, so a second helper is the only way to vary it
+  # without touching every other run_module call site.
+  helper :run_module_timeout, args: [:string, :i64, :string, :string, :string, :i64], returns: :string do |host, port, path, entry, arguments, timeout|
+    module_source = Json.read_text(path) || raise("#{path} not found: the Python module these tools run lives there")
+    qargs = Json.quote(arguments)
+    qentry = Json.quote(entry)
+    qpath = Json.quote(path)
+    qmodule = Json.quote("_mcp_module_#{Json.short_hash(module_source)}")
+    qsource = Json.quote(module_source)
+    call = "print('__MCP_RESULT__' + _json.dumps(getattr(mod, #{qentry})(_json.loads(#{qargs}))))"
+    invoke = "import sys, json as _json\nmod = sys.modules.get(#{qmodule})\nif mod is None:\n    print('__MCP_NEED_INSTALL__')\nelse:\n    #{call}\n"
+    install = "import sys, types, json as _json\nmod = sys.modules.get(#{qmodule})\nif mod is None:\n    mod = types.ModuleType(#{qmodule})\n    mod.__file__ = #{qpath}\n    exec(compile(#{qsource}, #{qpath}, 'exec'), mod.__dict__)\n    sys.modules[#{qmodule}] = mod\n#{call}\n"
+    invoke_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(invoke)}}}"
+    install_request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(install)}}}"
+    raw = Json.parse(rust(:blender_call_timeout, host, port, invoke_request, timeout))
+    resp = raw || raise("Blender bridge unreachable: start the MCP Bridge add-on (addon/mcp_bridge.py) in Blender's sidebar, and give this server its token as BLENDER_BRIDGE_TOKEN")
+    status = Json.text(resp, "/status") || "error"
+    stdout = Json.text(resp, "/result/result") || ""
+    cold = if Rust::Str(stdout).trim.to_s == "__MCP_NEED_INSTALL__" then true else false end
+    retry_resp = if cold then (Json.parse(rust(:blender_call_timeout, host, port, install_request, timeout)) || raise("Blender bridge unreachable: start the MCP Bridge add-on (addon/mcp_bridge.py) in Blender's sidebar, and give this server its token as BLENDER_BRIDGE_TOKEN")) else resp end
+    retry_status = if cold then (Json.text(retry_resp, "/status") || "error") else status end
+    retry_stdout = if cold then (Json.text(retry_resp, "/result/result") || "") else stdout end
+    raise (Json.text(retry_resp, "/message") || "Blender returned an error") unless retry_status == "success"
+    retry_stdout.split("__MCP_RESULT__").last || raise("the script finished without a result")
   end
 
-  # Run the addon's LOOK script with a ready-made argument object and return the
+  # The plain viewport capture: viewport_screenshot in our own module draws the
+  # open 3D viewport offscreen, as it is, with no setting changed. Returns the
+  # PNG as base64.
+  helper :viewport_png, args: [:string, :i64, :string, :i32], returns: :string do |host, port, path, max_size|
+    shot = Json.temp_png("viewport")
+    value = Json.parse(run_module(host, port, path, "viewport_screenshot", "{\"max_size\":#{max_size},\"filepath\":#{Json.quote(shot)}}")) || raise("could not parse the screenshot result")
+    problem = Json.text(value, "/error") || ""
+    raise problem unless problem == ""
+    Json.take_file_base64(shot) || raise("could not read the screenshot file")
+  end
+
+  # Run the look entry point with a ready-made argument object and return the
   # JSON it reports: what it drew, which views or frames, the framed size and
-  # centre. The PNG it wrote is read separately. Unlike the native capture it
-  # needs an open 3D viewport area, which is why viewport mode prefers
-  # viewport_png.
-  helper :look_info, args: [:string, :i64, :string, :string], returns: :string do |host, port, scripts, look_args|
-    info = Json.parse(run_script(host, port, scripts, "LOOK", look_args)) || raise("could not parse the look result")
+  # centre. The PNG it wrote is read separately. It changes shading and overlays
+  # to take the picture (and restores them), which is why plain viewport mode
+  # uses viewport_png instead.
+  helper :look_info, args: [:string, :i64, :string, :string], returns: :string do |host, port, path, look_args|
+    info = Json.parse(run_module(host, port, path, "look", look_args)) || raise("could not parse the look result")
     problem = Json.text(info, "/error") || ""
     raise problem unless problem == ""
     Json.dump(info) || raise("could not encode the look result")
-  end
-
-  # --- 3D generation: text or image to one imported, textured object ---
-  #
-  # generate_3d and make_3d share this layer. The addon's generators (Tripo,
-  # Hunyuan3D, Hyper3D Rodin) each have their own submit, poll and import
-  # commands; the helpers below choose one, submit, poll with the async sleep
-  # until the wait budget runs out, then import and report the model's world
-  # bounding box and how to place it. A poll that outlives the budget returns
-  # a resumable handle instead of losing the paid generation. Every
-  # handler-level failure arrives as status: "success" with an {"error": ...}
-  # result, so gen_problem checks for that rather than trusting the bridge's
-  # status, and a reply that is not JSON at all is reported as unparseable.
-  helper :gen_default_name, args: [:string], returns: :string do |prompt|
-    cleaned = prompt.gsub(/[^A-Za-z0-9]/, " ")
-    word = cleaned.split.first || ""
-    if word == ""
-      "Generated"
-    else
-      initial = (word[0, 1] || "").upcase
-      tail = word[1, word.length - 1] || ""
-      "#{initial}#{tail}"
-    end
-  end
-
-  # A generator's status command returns {"enabled": ...}. gen_status reads
-  # that flag as a bool, and gen_choose turns a false into the message that
-  # names what to switch on in Blender's sidebar.
-  helper :gen_status, args: [:string, :i64, :string], returns: :bool do |host, port, command|
-    request = "{\"type\":\"#{command}\",\"params\":{}}"
-    parsed = Json.parse(blender_request(host, port, request)) || raise("could not parse #{command}")
-    enabled = Json.at(parsed, "/enabled") || raise("the #{command} reply has no enabled flag")
-    flag = Json.dump(enabled) || raise("could not encode #{command}")
-    flag == "true"
-  end
-
-  # Resolve the requested provider to one that is actually enabled: auto
-  # prefers Tripo, then Hunyuan3D, then Hyper3D Rodin, and any other name must
-  helper :gen_choose, args: [:string, :i64, :string], returns: :string do |host, port, requested|
-    want = requested.downcase
-    if want == "auto"
-      tripo = gen_status(host, port, "get_tripo_status")
-      hunyuan = gen_status(host, port, "get_hunyuan3d_status")
-      hyper = gen_status(host, port, "get_hyper3d_status")
-      if tripo then "tripo" elsif hunyuan then "hunyuan3d" elsif hyper then "hyper3d" else raise("No 3D generator is enabled. In Blender's MCP for Blender sidebar (press N in the 3D Viewport), turn on Hunyuan3D or Hyper3D Rodin with an API key, or use MCP for Blender Premium (no keys needed): https://mcp-for-blender.com/premium") end
-    elsif want == "tripo"
-      gen_status(host, port, "get_tripo_status") ? "tripo" : raise("Tripo is only available with MCP for Blender Premium. If Premium is on, update the Blender addon: run `uvx mcp-for-blender install-addon`, then restart Blender.")
-    elsif want == "hunyuan3d"
-      gen_status(host, port, "get_hunyuan3d_status") ? "hunyuan3d" : raise("Hunyuan3D is not enabled. Turn it on and add an API key (or point it at a local server) in the MCP for Blender sidebar in Blender (press N in the 3D Viewport), then restart the connection.")
-    elsif want == "hyper3d"
-      gen_status(host, port, "get_hyper3d_status") ? "hyper3d" : raise("Hyper3D Rodin is not enabled. Turn it on and add an API key in the MCP for Blender sidebar in Blender (press N in the 3D Viewport), then restart the connection.")
-    else
-      raise("Unknown provider '#{requested}'. Use one of: auto, hyper3d, hunyuan3d, tripo")
-    end
-  end
-
-  # The addon's handlers answer status: "success" even when the command
-  # failed; the failure is an {"error": ...} (or a code/message pair) inside
-  # the result. gen_problem pulls that out and returns "" when there is none.
-  helper :gen_problem, args: [:string], returns: :string do |text|
-    parsed = Json.parse(text) || raise("the Blender addon returned an unparseable reply: #{text}")
-    as_text = Json.text(parsed, "") || ""
-    as_error = Json.text(parsed, "/error") || ""
-    as_code = Json.text(parsed, "/code") || ""
-    as_message = Json.text(parsed, "/message") || ""
-    if as_text != "" && as_text.downcase.start_with?("error")
-      as_text
-    elsif as_code != ""
-      if as_message != "" then "#{as_message} (code #{as_code}; tell the user as written and don't retry automatically)" else "#{as_code} (tell the user as written and don't retry automatically)" end
-    else
-      as_error
-    end
-  end
-
-  # One raw addon command with a ready-made params object, through the shared
-  # bridge helper, so the generation commands all take the same path.
-  helper :gen_raw, args: [:string, :i64, :string, :string], returns: :string do |host, port, command, params|
-    request = "{\"type\":\"#{command}\",\"params\":#{params}}"
-    blender_request(host, port, request)
-  end
-
-  # Submit one job to the chosen provider and return a small JSON reply with
-  # either {"status":"job","handle":...} or a finished local Hunyuan3D
-  # {"status":"done",...}; a submit failure raises the handler's own message.
-  helper :gen_submit, args: [:string, :i64, :string, :string, :string, :string, :string], returns: :string do |host, port, provider, prompt, image, quality, bbox_json|
-    if provider == "tripo"
-      quality_field = if quality == "" then "" else ",\"quality\":#{Json.quote(quality)}" end
-      params = "{\"text_prompt\":#{Json.quote(prompt)},\"image\":#{Json.quote(image)}#{quality_field}}"
-      raw = gen_raw(host, port, "create_tripo_job", params)
-      problem = gen_problem(raw)
-      raise problem unless problem == ""
-      parsed = Json.parse(raw) || raise("could not parse the Tripo reply: #{raw}")
-      request_id = Json.text(parsed, "/request_id") || ""
-      raise "Tripo returned no request id: #{raw}" if request_id == ""
-      "{\"status\":\"job\",\"handle\":\"tripo:rid:#{request_id}\"}"
-    elsif provider == "hunyuan3d"
-      quality_field = if quality == "" then "" else ",\"quality\":#{Json.quote(quality)}" end
-      params = "{\"text_prompt\":#{Json.quote(prompt)},\"image\":#{Json.quote(image)}#{quality_field}}"
-      raw = gen_raw(host, port, "create_hunyuan_job", params)
-      problem = gen_problem(raw)
-      raise problem unless problem == ""
-      parsed = Json.parse(raw) || raise("could not parse the Hunyuan3D reply: #{raw}")
-      nested_message = Json.text(parsed, "/Response/Error/Message") || ""
-      nested_plain = Json.text(parsed, "/Response/Error") || ""
-      nested_error = if nested_message != "" then nested_message else nested_plain end
-      raise nested_error unless nested_error == ""
-      job_id = Json.text(parsed, "/Response/JobId") || ""
-      status = Json.text(parsed, "/status") || ""
-      if job_id != ""
-        "{\"status\":\"job\",\"handle\":\"hunyuan3d:job:job_#{job_id}\"}"
-      elsif status == "DONE"
-        "{\"status\":\"done\",\"message\":\"Generated and imported by the local Hunyuan3D server. Find it with get_scene_info.\"}"
-      else
-        raise("Hunyuan3D returned no job: #{raw}")
-      end
-    else
-      images = if image == ""
-        "null"
-      elsif image.start_with?("http://") || image.start_with?("https://")
-        "[#{Json.quote(image)}]"
-      else
-        data = rust(:gen_file_base64, image)
-        raise "Image not found: #{image}. Give an absolute image file path or an http(s) URL, or use a prompt instead." if data == ""
-        "[[#{Json.quote(rust(:gen_path_suffix, image))},#{Json.quote(data)}]]"
-      end
-      rodin_prompt = if image == "" then Json.quote(prompt) else "null" end
-      params = "{\"text_prompt\":#{rodin_prompt},\"images\":#{images},\"bbox_condition\":#{bbox_json}}"
-      raw = gen_raw(host, port, "create_rodin_job", params)
-      problem = gen_problem(raw)
-      raise problem unless problem == ""
-      parsed = Json.parse(raw) || raise("could not parse the Hyper3D reply: #{raw}")
-      uuid = Json.text(parsed, "/uuid") || ""
-      subscription = Json.text(parsed, "/jobs/subscription_key") || ""
-      request_id = Json.text(parsed, "/request_id") || ""
-      if uuid != "" && subscription != ""
-        "{\"status\":\"job\",\"handle\":\"hyper3d:main:#{uuid}|#{subscription}\"}"
-      elsif request_id != ""
-        "{\"status\":\"job\",\"handle\":\"hyper3d:fal:#{request_id}\"}"
-      else
-        raise("Hyper3D Rodin returned no job: #{raw}")
-      end
-    end
-  end
-
-  # One poll: ask the provider for the job's state and return a small JSON
-  # object with a state of running, done or failed. The detail carries the
-  helper :gen_poll, args: [:string, :i64, :string, :string, :string, :string], returns: :string do |host, port, provider, kind, ident, hint|
-    if provider == "tripo" || (provider == "hyper3d" && kind == "fal")
-      command = if provider == "tripo" then "poll_tripo_job_status" else "poll_rodin_job_status" end
-      raw = gen_raw(host, port, command, "{\"request_id\":#{Json.quote(ident)}}")
-      parsed = Json.parse(raw) || raise("could not parse the status reply: #{raw}")
-      status = (Json.text(parsed, "/status") || "").upcase
-      if status == "COMPLETED"
-        problem = gen_problem(raw)
-        raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
-        "{\"state\":\"done\",\"detail\":\"\"}"
-      elsif status != "" && status != "IN_QUEUE" && status != "IN_PROGRESS"
-        detail = Json.text(parsed, "/error") || status
-        "{\"state\":\"failed\",\"detail\":#{Json.quote(detail)}}"
-      else
-        problem = gen_problem(raw)
-        raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
-        detail = if status == "" then "IN_QUEUE" else status end
-        "{\"state\":\"running\",\"detail\":#{Json.quote(detail)}}"
-      end
-    elsif provider == "hyper3d"
-      subscription = ident.split("|").last || ident
-      raw = gen_raw(host, port, "poll_rodin_job_status", "{\"subscription_key\":#{Json.quote(subscription)}}")
-      problem = gen_problem(raw)
-      raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
-      parsed = Json.parse(raw) || raise("could not parse the Rodin status reply: #{raw}")
-      statuses = Json.text_list(parsed, "/status_list") || []
-      joined = statuses.join(", ")
-      done = statuses.length > 0 && joined.gsub("Done", "").gsub(",", "").gsub(" ", "") == ""
-      failed = joined.include?("Failed") || joined.include?("Canceled")
-      detail = if statuses.length == 0 then "Waiting" else joined end
-      if done
-        "{\"state\":\"done\",\"detail\":\"\"}"
-      elsif failed
-        "{\"state\":\"failed\",\"detail\":#{Json.quote(detail)}}"
-      else
-        "{\"state\":\"running\",\"detail\":#{Json.quote(detail)}}"
-      end
-    else
-      raw = gen_raw(host, port, "poll_hunyuan_job_status", "{\"job_id\":#{Json.quote(ident)}}")
-      problem = gen_problem(raw)
-      raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
-      parsed = Json.parse(raw) || raise("could not parse the Hunyuan3D status reply: #{raw}")
-      status = Json.text(parsed, "/Response/Status") || ""
-      poll_message = Json.text(parsed, "/Response/ErrorMessage") || ""
-      poll_plain = Json.text(parsed, "/Response/Error") || ""
-      nested_error = if poll_message != "" then poll_message else poll_plain end
-      if status == "DONE"
-        file_count = Json.count(parsed, "/Response/ResultFile3Ds") || 0
-        url0 = if file_count > 0 then Json.text(parsed, "/Response/ResultFile3Ds/0/Url") || "" else "" end
-        type0 = if file_count > 0 then (Json.text(parsed, "/Response/ResultFile3Ds/0/Type") || "").upcase else "" end
-        url1 = if file_count > 1 then Json.text(parsed, "/Response/ResultFile3Ds/1/Url") || "" else "" end
-        type1 = if file_count > 1 then (Json.text(parsed, "/Response/ResultFile3Ds/1/Type") || "").upcase else "" end
-        model = if type0 == "GLB" then url0 elsif type1 == "GLB" then url1 elsif url0 != "" then url0 else url1 end
-        if model == ""
-          "{\"state\":\"failed\",\"detail\":\"finished without a model file\"}"
-        else
-          "{\"state\":\"done\",\"detail\":#{Json.quote(model)}}"
-        end
-      elsif status == "FAIL" || nested_error != ""
-        detail = if nested_error != "" then nested_error else "generation failed" end
-        "{\"state\":\"failed\",\"detail\":#{Json.quote(detail)}}"
-      else
-        detail = if status == "" then "WAIT" else status end
-        "{\"state\":\"running\",\"detail\":#{Json.quote(detail)}}"
-      end
-    end
-  end
-
-  # Import a finished job and return "" on success or a reason on failure;
-  helper :gen_import, args: [:string, :i64, :string, :string, :string, :string, :string, :string], returns: :string do |host, port, provider, kind, ident, name, detail, hint|
-    raw = if provider == "tripo"
-      gen_raw(host, port, "import_generated_asset_tripo", "{\"request_id\":#{Json.quote(ident)},\"name\":#{Json.quote(name)}}")
-    elsif provider == "hyper3d" && kind == "fal"
-      gen_raw(host, port, "import_generated_asset", "{\"request_id\":#{Json.quote(ident)},\"name\":#{Json.quote(name)}}")
-    elsif provider == "hyper3d"
-      task_uuid = ident.split("|").first || ident
-      gen_raw(host, port, "import_generated_asset", "{\"task_uuid\":#{Json.quote(task_uuid)},\"name\":#{Json.quote(name)}}")
-    else
-      gen_raw(host, port, "import_generated_asset_hunyuan", "{\"name\":#{Json.quote(name)},\"zip_file_url\":#{Json.quote(detail)}}")
-    end
-    problem = gen_problem(raw)
-    raise "#{problem}. The generation may still be running or finished. #{hint}" unless problem == ""
-    parsed = Json.parse(raw) || raise("could not parse the import reply: #{raw}")
-    succeed = if Json.has?(parsed, "/succeed") then Json.dump(Json.at(parsed, "/succeed") || raise("could not read the import flag")) || "true" else "true" end
-    if succeed == "false"
-      reason_error = Json.text(parsed, "/error") || ""
-      reason_message = Json.text(parsed, "/message") || ""
-      reason = if reason_error != "" then reason_error elsif reason_message != "" then reason_message else "the addon reported no imported object" end
-      raise("#{reason}. The generation may have finished but the import failed. #{hint}")
-    else
-      ""
-    end
-  end
-
-  # The success reply: "Generated and imported ...", then the imported
-  # object's world_bounding_box and size from the addon's BOUNDS script, plus
-  # the placement guidance, so the model can be sized and grounded.
-  helper :gen_success, args: [:string, :i64, :string, :string, :string], returns: :string do |host, port, scripts, name, provider|
-    reply = "Generated and imported '#{name}' with #{provider}."
-    arguments = "{\"names\":[#{Json.quote(name)}]}"
-    bounds = Json.parse(run_script(host, port, scripts, "BOUNDS", arguments)) || raise("could not read the bounding box")
-    count = Json.count(bounds, "") || 0
-    if count == 0
-      reply
-    else
-      b_name = Json.text(bounds, "/0/name") || name
-      lo0 = Json.f64(bounds, "/0/world_bounding_box/0/0") || 0.0
-      lo1 = Json.f64(bounds, "/0/world_bounding_box/0/1") || 0.0
-      lo2 = Json.f64(bounds, "/0/world_bounding_box/0/2") || 0.0
-      hi0 = Json.f64(bounds, "/0/world_bounding_box/1/0") || 0.0
-      hi1 = Json.f64(bounds, "/0/world_bounding_box/1/1") || 0.0
-      hi2 = Json.f64(bounds, "/0/world_bounding_box/1/2") || 0.0
-      s0 = Json.f64(bounds, "/0/size/0") || 0.0
-      s1 = Json.f64(bounds, "/0/size/1") || 0.0
-      s2 = Json.f64(bounds, "/0/size/2") || 0.0
-      "#{reply} world_bounding_box min [#{lo0}, #{lo1}, #{lo2}], max [#{hi0}, #{hi1}, #{hi2}] (size #{s0} x #{s1} x #{s2} m). Generated models have arbitrary scale and facing: scale it to real size, put its lowest point on the ground, rotate it to face the right way, then look(mode=\"angles\", target=[\"#{b_name}\"])."
-    end
-  end
-
-  # Wait for a handle to finish: poll until the job is done, failed, or the
-  # budget runs out, sleeping five seconds between polls. Done imports the
-  # model and reports it; a timeout returns a reply that carries the handle
-  # so the caller can resume without starting (and paying for) a new job.
-  helper :gen_wait, args: [:string, :i64, :string, :string, :string, :i64], returns: :string do |host, port, scripts, handle, name, polls|
-    provider = handle.split(":").first || ""
-    rest = handle[provider.length + 1, handle.length] || ""
-    kind = rest.split(":").first || ""
-    ident = rest[kind.length + 1, rest.length] || ""
-    known = provider == "tripo" || provider == "hunyuan3d" || provider == "hyper3d"
-    raise "Not a generation job handle: #{handle}. It should look like provider:kind:id, as an earlier generate_3d reply returned." unless known && kind != "" && ident != ""
-    hint = "Call generate_3d(job=\"#{handle}\", name=\"#{name}\") to keep waiting; it imports the model when it's ready. Don't start a new generation."
-    polls.times.each do |i|
-      polled = gen_poll(host, port, provider, kind, ident, hint)
-      parsed = Json.parse(polled) || raise("could not parse the poll result: #{polled}")
-      state = Json.text(parsed, "/state") || "running"
-      detail = Json.text(parsed, "/detail") || ""
-      if state == "done"
-        import_failed = gen_import(host, port, provider, kind, ident, name, detail, hint)
-        if import_failed != ""
-          return "Import failed. #{hint}"
-        else
-          return gen_success(host, port, scripts, name, provider)
-        end
-      elsif state == "failed"
-        return "Generation failed: #{detail}. This attempt was not imported. Start a new generation when you are ready."
-      elsif i + 1 >= polls
-        return "Still generating (#{provider}: #{detail}). #{hint}"
-      else
-        paused = rust(:sleep_ms, 5000)
-        paused > 0
-      end
-    end
-    "Still generating (#{provider}: unknown). #{hint}"
-  end
-
-  # Hyper3D Rodin's bbox_condition is three positive proportions or absent; a
-  # three-element check here keeps the request well-formed.
-  helper :gen_bbox, args: [:i64_list], returns: :string do |bbox_condition|
-    if bbox_condition.length == 0
-      "null"
-    elsif bbox_condition.length != 3
-      raise("bbox_condition must be three positive numbers [length, width, height]")
-    elsif bbox_condition.any? { |value| value <= 0 }
-      raise("bbox_condition must be three positive numbers [length, width, height]")
-    else
-      Json.i64_list_json(bbox_condition)
-    end
-  end
-
-  # The one entry point both tools use. With a job handle it resumes; without
-  # one it checks that exactly one of prompt/image was given, chooses a
-  # provider, submits, then waits. wait_seconds is the caller's budget, capped
-  helper :gen_run, args: [:string, :i64, :string, :string, :string, :string, :string, :string, :string, :string, :i64], returns: :string do |host, port, scripts, prompt, image, name, provider, quality, bbox_json, job, wait_seconds|
-    budget = if wait_seconds > 45 then 45 else wait_seconds end
-    polls = if budget < 5 then 1 else budget / 5 end
-    if job != ""
-      resume_name = if name == "" then "Generated" else name end
-      gen_wait(host, port, scripts, job, resume_name, polls)
-    else
-      raise "give exactly one of prompt or image." if (prompt == "") == (image == "")
-      chosen = gen_choose(host, port, provider.downcase)
-      object_name = if name == "" then gen_default_name(prompt) else name end
-      submitted = gen_submit(host, port, chosen, prompt, image, quality, bbox_json)
-      parsed = Json.parse(submitted) || raise("could not parse the submit result: #{submitted}")
-      status = Json.text(parsed, "/status") || ""
-      if status == "job"
-        job_handle = Json.text(parsed, "/handle") || raise("the generation returned no job handle")
-        gen_wait(host, port, scripts, job_handle, object_name, polls)
-      else
-        message = Json.text(parsed, "/message") || "Generation finished."
-        message
-      end
-    end
   end
 
   params :SceneParams do
@@ -485,16 +168,15 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   output :Scene do
-    field :items, Json::Value, description: "The addon's list_scene_items result: items and total"
+    field :items, Json::Value, description: "Matching items (kind, name, detail), names starting with the query first, and the total"
   end
 
   tool :scene, params: :SceneParams, title: "Scene items",
        description: "List objects, materials and collections in the current Blender scene, optionally filtered by name",
        output: :Scene, read_only: true, open_world: true do
     body do |query, limit|
-      quoted = Json.quote(query)
-      request = "{\"type\":\"list_scene_items\",\"params\":{\"query\":#{quoted},\"limit\":#{limit}}}"
-      value = Json.parse(blender_request(setting(:blender_host), Integer(setting(:blender_port), 10), request)) || raise("could not parse the scene items")
+      arguments = "{\"query\":#{Json.quote(query)},\"limit\":#{limit}}"
+      value = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "scene_items", arguments)) || raise("could not parse the scene items")
       result(:Scene, items: value)
     end
   end
@@ -512,7 +194,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   tool :scene_info, params: :SceneInfoParams, title: "Scene facts",
-       description: "Facts about the scene: what is there, where, how big, and how healthy meshes and rigs are. Runs the addon's scene-summary script inside Blender through execute_code",
+       description: "Facts about the scene: what is there, where, how big, and how healthy meshes and rigs are. Runs the scene-summary entry point of this server's own Python module inside Blender",
        output: :SceneInfo, read_only: true, open_world: true do
     body do |query, root, detail, limit|
       q = query || ""
@@ -533,7 +215,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
       jq = Json.quote(q)
       jr = Json.quote(r)
       arguments = "{\"query\":#{jq},\"root\":#{jr},\"limit\":#{limit},\"fields\":#{fields}}"
-      data = Json.parse(run_script(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_scripts), "SCENE_SUMMARY", arguments)) || raise("could not parse the scene summary")
+      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "scene_summary", arguments)) || raise("could not parse the scene summary")
       result(:SceneInfo, data: data)
     end
   end
@@ -560,7 +242,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   params :ImageReportParams do
-    field :source, :string, description: "Name of an image already in the file, or a path to an image on disk"
+    field :source, :string, description: "Name of an image already in the file, or a path to an image on disk under the file roots"
     field :width, :i32, description: "Characters across; rows follow the image's aspect", default: 116, min: 40, max: 200
   end
 
@@ -568,14 +250,14 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
        description: "Describe an image to a reader that cannot see it: dimensions and aspect, the mean colour and the six most common colours, then two character grids over the same cells, one for tone (dark to bright) and one for hue (red/yellow/green/cyan/blue/magenta, grey or desaturated as a dot). Use it when an image content block cannot be read directly.",
        output: :TextReport, read_only: true, open_world: true do
     body do |source, width|
-      args = "{\"source\":#{Json.quote(source)},\"width\":#{width}}"
+      args = "{\"source\":#{Json.quote(image_ref(source, setting(:write_roots), setting(:read_roots)))},\"width\":#{width}}"
       data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "image_report", args)) || raise("could not parse the image report")
       result(:TextReport, report: Json.text(data, "/report") || raise("the image script returned no text"))
     end
   end
 
   params :ImageReportRustParams do
-    field :source, :string, description: "Path to an image file on the machine this server runs on"
+    field :source, :string, description: "Path to an image file under the file roots, on the machine this server runs on"
     field :width, :i32, description: "Cells across; rows follow the image's aspect at 2:1 cells", default: 116, min: 40, max: 200
   end
 
@@ -583,8 +265,9 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
        description: "The same job as image_report, and more, computed in this server's own Rust rather than inside Blender: dimensions, aspect, mean and the most common colours, a tone grid, a hue-and-strength grid (case carries saturation), a spectrum ordered by hue, and a summary naming what is in the picture and roughly where. It reads the file itself, so it needs no Blender session and works while the addon is stopped. Kept beside image_report so one picture can go through both and the texts compared.",
        output: :TextReport, read_only: true, open_world: true do
     body do |source, width|
-      report = rust(:grid, source, width)
-      bytes = ImageFile.size(source)
+      path = jail(source, setting(:write_roots), setting(:read_roots), "read")
+      report = rust(:grid, path, width)
+      bytes = ImageFile.size(path)
       measured = if bytes.nil? then report else "#{report}\nfile #{bytes || 0} bytes" end
       result(:TextReport, report: measured)
     end
@@ -694,7 +377,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   tool :remove, params: :RemoveParams, title: "Remove objects",
-       description: "Delete named objects from the scene and report the cost: what went, which of their children were left unparented, what the orphan purge freed, and what is left. The counterpart of text, place and import_asset. Blender's own undo may not cover it, so treat a removal as final.",
+       description: "Delete named objects from the scene and report the cost: what went, which of their children were left unparented, what the orphan purge freed, and what is left. The counterpart of text and place. Blender's own undo may not cover it, so treat a removal as final.",
        output: :TextReport, destructive: true, open_world: true do
     body do |names, purge|
       listed = Json.str_list_json(names)
@@ -826,7 +509,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   tool :modifier, params: :ModifierParams, title: "Add or remove a modifier",
-       description: "Add, remove or list one modifier on a mesh: subdivision, bevel, mirror, solidify, decimate or wireframe, with the setting that matters for that kind typed. The report gives the base and evaluated face counts, so an effect that did nothing is visible rather than assumed. The long tail of modifier properties is not typed; use command or execute_code when a specific one is needed.",
+       description: "Add, remove or list one modifier on a mesh: subdivision, bevel, mirror, solidify, decimate or wireframe, with the setting that matters for that kind typed. The report gives the base and evaluated face counts, so an effect that did nothing is visible rather than assumed. The long tail of modifier properties is not typed; set one with execute_code.",
        output: :TextReport, destructive: true, open_world: true do
     body do |name, action, kind, count, amount, axis, apply|
       wanted_kind = kind || ""
@@ -840,7 +523,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   params :ImageViewParams do
-    field :source, :string, description: "Path to an image file on the machine this server runs on"
+    field :source, :string, description: "Path to an image file under the file roots, on the machine this server runs on"
     field :width, :i32, description: "Cells across", default: 64, min: 20, max: 200
     field :mode, :string, description: "half: two samples stacked, two colours. braille: eight samples (a 4x2 dot grid) as one dithered glyph, four times the vertical detail. blend: the same eight samples with two colours, the lit dots in front and the gaps behind", enum: ["half", "braille", "blend"], default: "blend"
     field :dither, :string, description: "diffusion: Floyd-Steinberg, where each dot's rounding error spills into its neighbours, giving irregular dots that read as tone. ordered: a 4x4 Bayer threshold, regular by construction and so more textured. threshold: a hard 50% cut", enum: ["diffusion", "ordered", "threshold"], default: "diffusion"
@@ -850,7 +533,8 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
        description: "The image itself, as truecolour text for a human to look at, in three modes: half draws two stacked samples per cell with two colours; braille draws a dithered 4x2 dot grid as one glyph, four times the vertical detail, which makes a flat tone read as tone; blend does braille with the lit dots in one colour and the gaps in another, so shape and colour both survive. This is for eyes, not for a model: a text model should read image_report or image_report_rust, which cost a fraction of the tokens. It needs a client that passes ANSI through, a terminal that renders truecolour, and a font carrying braille and block glyphs.",
        output: :TextReport, read_only: true, open_world: true do
     body do |source, width, mode, dither|
-      result(:TextReport, report: rust(:ansi, source, width, mode, dither))
+      path = jail(source, setting(:write_roots), setting(:read_roots), "read")
+      result(:TextReport, report: rust(:ansi, path, width, mode, dither))
     end
   end
 
@@ -860,32 +544,74 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   params :RenderParams do
-    field :file, :string, description: "Where to write the PNG; unset writes <name>-render.png beside the .blend, or on the Desktop for an unsaved file", optional: true
+    field :file, :string, description: "Where to write the PNG, under the write roots (BLENDER_WRITE_ROOTS); a relative path lands under the first root, and unset writes <name>-render.png in its renders folder", optional: true
     field :camera, :string, description: "Camera to render from; unset uses the scene camera", optional: true
     field :width, :i32, description: "Pixels across; unset keeps the file's setting", optional: true, min: 16, max: 8192
     field :height, :i32, description: "Pixels down; unset keeps the file's setting", optional: true, min: 16, max: 8192
     field :samples, :i32, description: "Samples for the current engine; unset keeps the file's setting", optional: true, min: 1, max: 8192
     field :frame, :i32, description: "Frame to render; unset renders the current one", optional: true
+    field :timeout_seconds, :i64, description: "How long to wait for Blender before giving up; unset waits 900 s, which covers a Cycles still that outruns the default 60 s bridge timeout", optional: true, min: 1, max: 86400
   end
 
   tool :render, params: :RenderParams, title: "Render to a file",
        description: "Render the scene to a PNG at the resolution and sample count asked for and leave it on disk, so the result is a file the user keeps and can open. The report names the path, the size and the settings; read the picture back as text with image_report, or use look with mode camera when the picture should come back as an image in the reply.",
        output: :FileReport, destructive: true, open_world: true do
-    body do |file, camera, width, height, samples, frame|
-      wanted_file = file || ""
+    body do |file, camera, width, height, samples, frame, timeout_seconds|
+      roots = setting(:write_roots)
+      readable = setting(:read_roots)
+      wanted_file = if file.nil? then "" else jail(file || "", roots, readable, "write") end
+      folder = jail("renders", roots, readable, "write")
       wanted_camera = camera || ""
       qwidth = if width.nil? then "null" else width.to_s end
       qheight = if height.nil? then "null" else height.to_s end
       qsamples = if samples.nil? then "null" else samples.to_s end
       qframe = if frame.nil? then "null" else frame.to_s end
-      args = "{\"file\":#{Json.quote(wanted_file)},\"camera\":#{Json.quote(wanted_camera)},\"width\":#{qwidth},\"height\":#{qheight},\"samples\":#{qsamples},\"frame\":#{qframe}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "render", args)) || raise("could not parse the render report")
+      wait = timeout_seconds || 900
+      args = "{\"file\":#{Json.quote(wanted_file)},\"folder\":#{Json.quote(folder)},\"camera\":#{Json.quote(wanted_camera)},\"width\":#{qwidth},\"height\":#{qheight},\"samples\":#{qsamples},\"frame\":#{qframe}}"
+      data = Json.parse(run_module_timeout(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "render", args, wait)) || raise("could not parse the render report")
       result(:FileReport, path: Json.text(data, "/path") || "", report: Json.text(data, "/report") || raise("the render script returned no text"))
     end
   end
 
+  params :RenderAnimationParams do
+    field :file, :string, description: "Where to write the output, under the write roots (BLENDER_WRITE_ROOTS); a directory for format png (files land as <stem>_0001.png), or a file for a video; a relative path lands under the first root, and unset writes in its renders folder", optional: true
+    field :scene, :string, description: "Scene to render; unset uses the window's active scene", optional: true
+    field :camera, :string, description: "Camera to render from; unset uses the scene camera", optional: true
+    field :frame_start, :i32, description: "First frame of the range; unset uses the scene's frame_start", optional: true
+    field :frame_end, :i32, description: "Last frame of the range; unset uses the scene's frame_end", optional: true
+    field :fps, :i32, description: "Frames per second for the video; unset keeps the file's setting", optional: true
+    field :width, :i32, description: "Pixels across; unset keeps the file's setting", optional: true, min: 16, max: 8192
+    field :height, :i32, description: "Pixels down; unset keeps the file's setting", optional: true, min: 16, max: 8192
+    field :samples, :i32, description: "Samples for the current engine; unset keeps the file's setting", optional: true, min: 1, max: 8192
+    field :format, :string, description: "mp4, webm and mkv write a video through Blender's FFMPEG output; png writes a numbered sequence", enum: ["mp4", "webm", "mkv", "png"], default: "mp4"
+    field :timeout_seconds, :i64, description: "How long to wait for Blender before giving up; unset waits 3600 s, because a long range will outlive the default 60 s bridge timeout", optional: true, min: 1, max: 86400
+  end
+
+  tool :render_animation, params: :RenderAnimationParams, title: "Render an animation to a file",
+       description: "Render the frame range of a scene to a video (mp4, webm or mkv through Blender's FFMPEG output) or a PNG sequence, and leave it on disk. A long range can outlive the default bridge timeout, so raise timeout_seconds for it (or render in chunks). The report names the path, the frames and the format; a timed-out range is not lost, so check what was written before re-running.",
+       output: :FileReport, destructive: true, open_world: true do
+    body do |file, scene, camera, frame_start, frame_end, fps, width, height, samples, format, timeout_seconds|
+      roots = setting(:write_roots)
+      readable = setting(:read_roots)
+      wanted_file = if file.nil? then "" else jail(file || "", roots, readable, "write") end
+      folder = jail("renders", roots, readable, "write")
+      wanted_scene = scene || ""
+      wanted_camera = camera || ""
+      qframe_start = if frame_start.nil? then "null" else frame_start.to_s end
+      qframe_end = if frame_end.nil? then "null" else frame_end.to_s end
+      qfps = if fps.nil? then "null" else fps.to_s end
+      qwidth = if width.nil? then "null" else width.to_s end
+      qheight = if height.nil? then "null" else height.to_s end
+      qsamples = if samples.nil? then "null" else samples.to_s end
+      wait = timeout_seconds || 3600
+      args = "{\"file\":#{Json.quote(wanted_file)},\"folder\":#{Json.quote(folder)},\"scene\":#{Json.quote(wanted_scene)},\"camera\":#{Json.quote(wanted_camera)},\"frame_start\":#{qframe_start},\"frame_end\":#{qframe_end},\"fps\":#{qfps},\"width\":#{qwidth},\"height\":#{qheight},\"samples\":#{qsamples},\"format\":#{Json.quote(format)}}"
+      data = Json.parse(run_module_timeout(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "render_animation", args, wait)) || raise("could not parse the render_animation report")
+      result(:FileReport, path: Json.text(data, "/path") || "", report: Json.text(data, "/report") || raise("the render_animation script returned no text"))
+    end
+  end
+
   params :ExportParams do
-    field :file, :string, description: "Where to write the model; unset writes <name>.glb (or .fbx) beside the .blend", optional: true
+    field :file, :string, description: "Where to write the model, under the write roots (BLENDER_WRITE_ROOTS); a relative path lands under the first root, and unset writes <name>.glb (or .fbx) in its exports folder", optional: true
     field :format, :string, description: "glb carries materials and animation; fbx is the fallback for importers that need it", enum: ["glb", "fbx"], default: "glb"
     field :objects, :string_list, description: "Objects to export, children included; unset exports everything visible", optional: true
     field :selection_only, :bool, description: "Export the viewport selection instead", default: false
@@ -896,9 +622,12 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
        description: "Write the scene, or named objects with their children, to glTF (.glb) or FBX, so the work leaves Blender as one file. The report names the path, the size, and anything skipped because it is not in the current view layer. It replaces the viewport selection as a side effect, which the report says, so call reveal afterwards if the selection mattered.",
        output: :FileReport, destructive: true, open_world: true do
     body do |file, format, objects, selection_only, apply_modifiers|
-      wanted_file = file || ""
+      roots = setting(:write_roots)
+      readable = setting(:read_roots)
+      wanted_file = if file.nil? then "" else jail(file || "", roots, readable, "write") end
+      folder = jail("exports", roots, readable, "write")
       listed = Json.str_list_json(objects || [])
-      args = "{\"file\":#{Json.quote(wanted_file)},\"format\":#{Json.quote(format)},\"objects\":#{listed},\"selection_only\":#{selection_only},\"apply_modifiers\":#{apply_modifiers}}"
+      args = "{\"file\":#{Json.quote(wanted_file)},\"folder\":#{Json.quote(folder)},\"format\":#{Json.quote(format)},\"objects\":#{listed},\"selection_only\":#{selection_only},\"apply_modifiers\":#{apply_modifiers}}"
       data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "export", args)) || raise("could not parse the export report")
       result(:FileReport, path: Json.text(data, "/path") || "", report: Json.text(data, "/report") || raise("the export script returned no text"))
     end
@@ -927,14 +656,36 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   tool :execute_code, params: :CodeParams, title: "Execute Blender Python",
-       description: "Run Python inside the running Blender session and return what it printed. Arbitrary code runs with Blender's own privileges",
+       description: "Run Python inside the running Blender session and return what it printed. Guarded by default (BLENDER_CODE_POLICY): the code may import only bpy, bmesh, mathutils and pure-Python helpers, may not start processes, open sockets or load native code, and every file path it hands Blender must sit under the server's roots. A refusal names the line and the rule",
        output: :CodeResult, destructive: true, open_world: true do
     body do |code|
-      quoted = Json.quote(code)
-      request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{quoted}}}"
-      value = Json.parse(blender_request(setting(:blender_host), Integer(setting(:blender_port), 10), request)) || raise("could not parse the result")
-      output = Json.text(value, "/result") || ""
-      result(:CodeResult, output: output)
+      host = setting(:blender_host)
+      port = Integer(setting(:blender_port), 10)
+      policy = setting(:code_policy)
+      raise "execute_code is off on this server (BLENDER_CODE_POLICY=off); use the typed tools" if policy == "off"
+      raise "BLENDER_CODE_POLICY is #{policy}; it must be guarded, open or off" unless policy == "guarded" || policy == "open"
+      if policy == "open"
+        # Unchecked, as the user: the whole filesystem is in reach. Only for a
+        # session the user chose to open.
+        request = "{\"type\":\"execute_code\",\"params\":{\"code\":#{Json.quote(code)}}}"
+        value = Json.parse(blender_request(host, port, request)) || raise("could not parse the result")
+        result(:CodeResult, output: Json.text(value, "/result") || "")
+      else
+        # Guarded: upstream's validator first, unmodified, then python/mcp_guard.py
+        # runs the code with every path held to the roots (see its docstring).
+        verdict = Json.parse(run_module(host, port, "python/safe_mode.py", "is_safe", Json.quote(code))) || raise("could not parse the validator's verdict")
+        safe = Json.dump(Json.at(verdict, "/0") || raise("the validator returned no verdict")) || "false"
+        raise "refused by the validator, #{Json.text(verdict, "/1") || "no reason given"}. Rewrite the script within the rules, or use a typed tool" unless safe == "true"
+        arguments = "{\"code\":#{Json.quote(code)},\"write\":#{roots_json(setting(:write_roots))},\"read\":#{roots_json(setting(:read_roots))}}"
+        ran = Json.parse(run_module(host, port, "python/mcp_guard.py", "run", arguments)) || raise("could not parse the guard's result")
+        output = Json.text(ran, "/output") || ""
+        problem = Json.text(ran, "/error") || ""
+        # Interpolated, not assigned, so problem is not moved before the check
+        # below reads it: the generated Rust would not clone it.
+        failure = if output == "" then "#{problem}" else "#{problem}\n\nprinted before it stopped:\n#{output}" end
+        raise failure unless problem == ""
+        result(:CodeResult, output: output)
+      end
     end
   end
 
@@ -943,16 +694,16 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
   end
 
   output :Object do
-    field :object, Json::Value, description: "The addon's object info"
+    field :object, Json::Value, description: "Name, type, location, rotation, scale, visibility, materials, and for a mesh its world bounding box and counts"
   end
 
   tool :object_info, params: :ObjectParams, title: "Object info",
        description: "Return details for one scene object by name",
        output: :Object, read_only: true, open_world: true do
     body do |name|
-      quoted = Json.quote(name)
-      request = "{\"type\":\"get_object_info\",\"params\":{\"name\":#{quoted}}}"
-      value = Json.parse(blender_request(setting(:blender_host), Integer(setting(:blender_port), 10), request)) || raise("could not parse the object info")
+      value = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "object_info", "{\"name\":#{Json.quote(name)}}")) || raise("could not parse the object info")
+      problem = Json.text(value, "/error") || ""
+      raise problem unless problem == ""
       result(:Object, object: value)
     end
   end
@@ -965,7 +716,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
        description: "Capture the 3D viewport as a PNG image the model can look at. The visual feedback loop: look, then change",
        read_only: true, open_world: true do
     body do |max_size|
-      image(viewport_png(setting(:blender_host), Integer(setting(:blender_port), 10), max_size), "image/png")
+      image(viewport_png(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), max_size), "image/png")
     end
   end
 
@@ -978,7 +729,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     field :views, :string_list, description: "For angles: which sides to draw from (front, back, left, right, top, three_quarter); unset draws the default set", optional: true
     field :frames, :i64_list, description: "For frames: the frame numbers to sample; unset samples frame_count frames across the scene's range", optional: true
     field :view, :string, description: "An angle name, or \"camera\", to look from; unset keeps the current view", optional: true
-    field :image, :string, description: "For image: an image in the file, or a path on disk, to show", optional: true
+    field :image, :string, description: "For image: an image in the file, or a path on disk under the file roots, to show", optional: true
     field :distance, :f64, description: "Metres from the target centre to the eye; 0 fits the target automatically", default: 0.0, min: 0.0
     field :frame_count, :i32, description: "For frames: how many frames to sample when frames is unset", default: 6, min: 2, max: 12
     field :max_size, :i32, description: "Longest side in pixels; smaller keeps long sessions cheap", default: 768, min: 200, max: 2000
@@ -990,7 +741,7 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     body do |mode, shading, targets, views, frames, view, image, distance, frame_count, max_size|
       s = shading || ""
       v = view || ""
-      image_name = image || ""
+      image_name = if image.nil? then "" else image_ref(image || "", setting(:write_roots), setting(:read_roots)) end
       target_json = Json.str_list_json(targets || [])
       views_json = Json.str_list_json(views || [])
       frames_json = Json.i64_list_json(frames || [])
@@ -999,156 +750,39 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
       path = Json.temp_png("look")
       arguments = "{\"mode\":#{Json.quote(mode)},\"shading\":#{Json.quote(s)},\"target\":#{target_json},\"views\":#{views_json},\"distance\":#{distance},\"view\":#{Json.quote(v)},\"frames\":#{frames_json},\"frame_count\":#{frame_count},\"max_size\":#{max_size},\"image\":#{Json.quote(image_name)},\"filepath\":#{Json.quote(path)}}"
       scripted = !(mode == "viewport" && s == "")
-      caption = if scripted then look_info(host, port, setting(:blender_scripts), arguments) else "Viewport capture." end
-      data = if scripted then (Json.take_file_base64(path) || raise("could not read the look image")) else viewport_png(host, port, max_size) end
+      caption = if scripted then look_info(host, port, setting(:blender_python), arguments) else "Viewport capture." end
+      data = if scripted then (Json.take_file_base64(path) || raise("could not read the look image")) else viewport_png(host, port, setting(:blender_python), max_size) end
       [image(data, "image/png"), text(caption)]
-    end
-  end
-
-  params :CommandParams do
-    field :name, :string, description: "The addon command to run",
-          enum: ["ping", "get_scene_info", "get_world_state_snapshot", "get_addon_info",
-                 "get_object_info", "list_scene_items", "get_viewport_screenshot",
-                 "pick_viewport_object", "execute_code", "describe_node_type", "bpy_api_lookup",
-                 "drain_human_activity", "get_telemetry_consent", "set_telemetry_consent",
-                 "get_polyhaven_status", "get_hyper3d_status", "get_sketchfab_status",
-                 "get_polypizza_status", "get_hunyuan3d_status", "get_tripo_status",
-                 "export_scene", "get_polyhaven_categories", "search_polyhaven_assets",
-                 "download_polyhaven_asset", "get_polyhaven_asset_preview", "set_texture",
-                 "create_rodin_job", "poll_rodin_job_status", "import_generated_asset",
-                 "search_sketchfab_models", "get_sketchfab_model_preview", "download_sketchfab_model",
-                 "search_polypizza_models", "download_polypizza_model", "create_hunyuan_job",
-                 "poll_hunyuan_job_status", "import_generated_asset_hunyuan"]
-    field :args, :string, description: "JSON object of that command's arguments; {} when it takes none", default: "{}"
-  end
-
-  output :CommandResult do
-    field :result, Json::Value, description: "The addon's raw result for the command"
-  end
-
-  tool :command, params: :CommandParams, title: "Blender command",
-       description: "Run any command the Blender addon supports and return its raw result. Prefer the typed tools when one fits; use this for the long tail and for commands that take no arguments",
-       output: :CommandResult, destructive: true, open_world: true do
-    body do |name, args|
-      request = "{\"type\":\"#{name}\",\"params\":#{args}}"
-      value = Json.parse(blender_request(setting(:blender_host), Integer(setting(:blender_port), 10), request)) || raise("could not parse the result")
-      result(:CommandResult, result: value)
     end
   end
 
   # --- Asset libraries: Poly Haven, Sketchfab, Poly Pizza ---
   #
-  # Poly Pizza's API filters on numeric ids and the addon only validates ids,
-  # so its category and licence names are resolved here, exactly as the Python
-  # server's _polypizza_category_id / _polypizza_licence_id do.
-
-  helper :polypizza_category_id, args: [:string], returns: :string do |category|
-    stripped = rust(:trim_text, category)
-    digits_only = stripped != "" && stripped.gsub(/[0-9]/, "") == ""
-    if digits_only
-      value = stripped.to_i
-      raise "Poly Pizza category id #{value} is out of range (valid ids are 0-11)" if value > 11
-      "#{value}"
-    else
-      key = stripped.downcase.gsub(/[^a-z0-9]/, "")
-      case key
-      when "fooddrink", "food", "drink", "drinks" then "0"
-      when "clutter" then "1"
-      when "weapons", "weapon" then "2"
-      when "transport", "vehicle", "vehicles", "transportation" then "3"
-      when "furnituredecor", "furniture", "decor" then "4"
-      when "objects", "object", "prop", "props" then "5"
-      when "nature", "plant", "plants" then "6"
-      when "animals", "animal" then "7"
-      when "buildings", "building", "architecture", "buildingsarchitecture" then "8"
-      when "peoplecharacters", "person", "character", "characters", "people" then "9"
-      when "sceneslevels", "scene", "scenes", "level", "levels" then "10"
-      when "other" then "11"
-      else raise("Unknown Poly Pizza category '#{category}'. Valid categories: Food & Drink, Clutter, Weapons, Transport, Furniture & Decor, Objects, Nature, Animals, Buildings, People & Characters, Scenes & Levels, Other.")
-      end
-    end
-  end
-
-  helper :polypizza_licence_id, args: [:string], returns: :string do |licence|
-    stripped = rust(:trim_text, licence)
-    digits_only = stripped != "" && stripped.gsub(/[0-9]/, "") == ""
-    if digits_only
-      value = stripped.to_i
-      raise "Poly Pizza licence id #{value} is invalid (0 = CC-BY, 1 = CC0)" if value > 1
-      "#{value}"
-    else
-      key = stripped.downcase.gsub(/[^a-z0-9]/, "")
-      if key.start_with?("ccby") then "0"
-      elsif key.start_with?("cc0") then "1"
-      elsif key == "publicdomain" then "1"
-      else raise("Unknown Poly Pizza licence '#{licence}'. Use 'CC0' or 'CC-BY'.")
-      end
-    end
-  end
-
-  helper :download_polyhaven, args: [:string, :i64, :string, :string, :string, :string], returns: :string do |host, port, id, asset_type, resolution, file_format|
-    raise "polyhaven needs asset_type: hdris, textures or models" unless asset_type == "hdris" || asset_type == "textures" || asset_type == "models"
-    ff = if file_format == "" then "null" else Json.quote(file_format) end
-    request = "{\"type\":\"download_polyhaven_asset\",\"params\":{\"asset_id\":#{Json.quote(id)},\"asset_type\":#{Json.quote(asset_type)},\"resolution\":#{Json.quote(resolution)},\"file_format\":#{ff}}}"
-    blender_request(host, port, request)
-  end
-
-  helper :download_sketchfab, args: [:string, :i64, :string, :f64], returns: :string do |host, port, id, target_size|
-    raise "sketchfab needs target_size (metres, largest dimension)" if target_size == 0.0
-    request = "{\"type\":\"download_sketchfab_model\",\"params\":{\"uid\":#{Json.quote(id)},\"normalize_size\":true,\"target_size\":#{target_size}}}"
-    blender_request(host, port, request)
-  end
-
-  helper :download_polypizza, args: [:string, :i64, :string, :f64], returns: :string do |host, port, id, target_size|
-    normalize = target_size != 0.0
-    size = if normalize then target_size else 1.0 end
-    request = "{\"type\":\"download_polypizza_model\",\"params\":{\"model_id\":#{Json.quote(id)},\"normalize_size\":#{normalize},\"target_size\":#{size}}}"
-    blender_request(host, port, request)
-  end
-
-  helper :apply_texture_one, args: [:string, :string, :string, :i64, :string, :string], returns: :string do |source, asset_type, host, port, object_name, texture_id|
-    if source == "polyhaven" && asset_type == "textures"
-      request = "{\"type\":\"set_texture\",\"params\":{\"object_name\":#{Json.quote(object_name)},\"texture_id\":#{Json.quote(texture_id)}}}"
-      blender_request(host, port, request)
-    else
-      ""
-    end
-  end
+  # search_assets answers rust/blender_assets.rs's JSON as it is. import_asset
+  # downloads into a fresh folder under the first write root's downloads/ (the
+  # Rust side), then has Blender import it and delete the folder once every new
+  # image is packed (import_asset in python/mcp_scripts.py).
 
   params :AssetSearchParams do
-    field :source, :string, description: "Which library to search", enum: ["polyhaven", "sketchfab", "polypizza"]
+    field :source, :string, description: "Which library to search: polyhaven (CC0 HDRIs, PBR textures and models; no key needed), sketchfab or polypizza (each needs its API key in this server's environment)", enum: ["polyhaven", "sketchfab", "polypizza"]
     field :query, :string, description: "What you are looking for, in plain words", default: ""
     field :asset_type, :string, description: "polyhaven only: which asset types to search", enum: ["all", "hdris", "textures", "models"], default: "all"
-    field :category, :string, description: "polyhaven: a category path; sketchfab: comma-separated categories; polypizza: a category name such as \"Furniture & Decor\" or an id 0-11", optional: true
+    field :category, :string, description: "polyhaven: a taxonomy path such as \"Metal/Sheet & Corrugated\"; sketchfab: comma-separated category slugs; polypizza: a category name such as \"Furniture & Decor\" or an id 0-11", optional: true
     field :min_size_m, :f64, description: "polyhaven only: minimum real-world size in metres; use 2+ for walls, floors and ground", optional: true
     field :licence, :string, description: "polypizza only: \"CC0\" or \"CC-BY\"", optional: true
     field :animated, :bool, description: "polypizza only: return animated models only", default: false
-    field :limit, :i32, description: "How many results to return", default: 20, min: 1, max: 50
+    field :limit, :i32, description: "How many results to return (sketchfab at most 24, polypizza 32)", default: 20, min: 1, max: 50
   end
 
   tool :search_assets, params: :AssetSearchParams, title: "Search asset libraries",
-       description: "Search Poly Haven (HDRIs, PBR textures and models, all CC0), Sketchfab (user-made models) or Poly Pizza (stylised low-poly models) and return the addon's results as JSON; each result carries the id that import_asset takes. Poly Haven attribute filters are not typed; run them with command(name: \"search_polyhaven_assets\", args: ...). Result thumbnails (previews in the Python server, up to 6) are not fetched; to see one, call command(name: \"get_polyhaven_asset_preview\", ...) or get_sketchfab_model_preview.",
+       description: "Search Poly Haven (HDRIs, PBR textures and models, all CC0), Sketchfab (user-made models) or Poly Pizza (stylised low-poly models) and return the results as JSON; each result carries the id import_asset takes. Poly Haven textures report their real-world size (dimensions_mm). Sketchfab and Poly Pizza need API keys in this server's environment (BLENDERMCP_SKETCHFAB_API_KEY, BLENDERMCP_POLYPIZZA_API_KEY); without one the search says so, which is a message for the user.",
        read_only: true, open_world: true do
     body do |source, query, asset_type, category, min_size_m, licence, animated, limit|
-      category_text = category || ""
-      licence_text = licence || ""
-      raise "sketchfab needs a query" if source == "sketchfab" && query == ""
-      raise "polypizza needs a query or at least one filter (category, licence, or animated)" if source == "polypizza" && rust(:trim_text, query) == "" && category_text == "" && licence_text == "" && !animated
-      host = setting(:blender_host)
-      port = Integer(setting(:blender_port), 10)
-      query_json = Json.quote(query)
-      category_json = if category_text == "" then "null" else Json.quote(category_text) end
-      min_size_json = if min_size_m.nil? then "null" else min_size_m.to_s end
-      polypizza_category_json = if source != "polypizza" || category_text == "" then "null" else polypizza_category_id(category_text) end
-      licence_json = if source != "polypizza" || licence_text == "" then "null" else polypizza_licence_id(licence_text) end
-      request = if source == "polyhaven"
-        "{\"type\":\"search_polyhaven_assets\",\"params\":{\"asset_type\":#{Json.quote(asset_type)},\"category\":#{category_json},\"query\":#{query_json},\"limit\":#{limit},\"min_size_m\":#{min_size_json}}}"
-      elsif source == "sketchfab"
-        "{\"type\":\"search_sketchfab_models\",\"params\":{\"query\":#{query_json},\"categories\":#{category_json},\"count\":#{limit},\"downloadable\":true}}"
-      else
-        "{\"type\":\"search_polypizza_models\",\"params\":{\"query\":#{query_json},\"category\":#{polypizza_category_json},\"licence\":#{licence_json},\"animated\":#{animated},\"limit\":#{limit}}}"
-      end
-      blender_request(host, port, request)
+      found = rust(:asset_search, source, query, asset_type, category || "", licence || "", min_size_m || 0.0, animated, Integer(limit.to_s, 10))
+      value = Json.parse(found) || raise("could not parse the search result")
+      problem = Json.text(value, "/error") || ""
+      raise problem unless problem == ""
+      found
     end
   end
 
@@ -1156,90 +790,58 @@ server "blender", version: "0.1.0", instructions: "MCP for Blender drives the us
     field :source, :string, description: "Which library the asset came from", enum: ["polyhaven", "sketchfab", "polypizza"]
     field :id, :string, description: "The asset's id from search_assets (the uid for sketchfab)"
     field :asset_type, :string, description: "polyhaven only, required: hdris (becomes the world lighting), textures (builds a PBR material) or models", enum: ["hdris", "textures", "models"], optional: true
-    field :target_size, :f64, description: "Metres across the model's largest dimension (chair 1.0, car 4.5, cup 0.12); required for sketchfab, recommended for polypizza", optional: true
-    field :apply_to, :string_list, description: "Objects to apply a downloaded texture to; polyhaven textures only, replaces their materials", optional: true
-    field :resolution, :string, description: "polyhaven only: texture or HDRI resolution", enum: ["1k", "2k", "4k", "8k"], default: "1k"
-    field :file_format, :string, description: "polyhaven only: hdr/exr for HDRIs, jpg/png/exr for textures", optional: true
+    field :target_size, :f64, description: "Metres across the model's largest dimension (chair 1.0, car 4.5, cup 0.12); required for sketchfab, recommended for every model", optional: true
+    field :apply_to, :string_list, description: "polyhaven textures only: objects to give a material built from the texture; replaces their materials", optional: true
+    field :resolution, :string, description: "polyhaven only: texture, HDRI or model resolution", enum: ["1k", "2k", "4k", "8k"], default: "1k"
+    field :file_format, :string, description: "polyhaven only: hdr or exr for HDRIs; jpg, png or exr for textures; blend (the default, the artist's own materials) or gltf for models", optional: true
+    field :timeout_seconds, :i64, description: "How long to wait for Blender before giving up; unset waits 900 s, covering a download and import that outruns the default 60 s bridge timeout", optional: true, min: 1, max: 86400
   end
 
   tool :import_asset, params: :AssetImportParams, title: "Import an asset",
-       description: "Download an asset found with search_assets and bring it into the scene: Poly Haven through download_polyhaven_asset, Sketchfab through download_sketchfab_model, Poly Pizza through download_polypizza_model. A Poly Haven texture given apply_to is also applied to each named object with set_texture. Check the reported world_bounding_box and put the model on the ground",
+       description: "Download an asset found with search_assets and bring it into the scene: a Poly Haven HDRI becomes the world, a texture becomes a PBR material (and is applied to the apply_to objects), and a model from any library is imported, scaled to target_size when given. Images are packed into the .blend and the download is deleted. Check the reported world_bounding_box and put the model on the ground. Sketchfab and Poly Pizza need API keys in this server's environment.",
        destructive: true, open_world: true do
-    body do |source, id, asset_type, target_size, apply_to, resolution, file_format|
+    body do |source, id, asset_type, target_size, apply_to, resolution, file_format, timeout_seconds|
       host = setting(:blender_host)
       port = Integer(setting(:blender_port), 10)
-      at = asset_type || ""
-      ts = target_size || 0.0
-      ff = file_format || ""
-      names = apply_to || []
-      imported = if source == "polyhaven"
-        download_polyhaven(host, port, id, at, resolution, ff)
-      elsif source == "sketchfab"
-        download_sketchfab(host, port, id, ts)
+      kind = asset_type || ""
+      raise "polyhaven needs asset_type: hdris, textures or models" if source == "polyhaven" && kind == ""
+      raise "sketchfab needs target_size (metres across the largest dimension)" if source == "sketchfab" && target_size.nil?
+      wait = timeout_seconds || 900
+      downloads = jail("downloads", setting(:write_roots), setting(:read_roots), "write")
+      size = target_size || 0.0
+      names = Json.str_list_json(apply_to || [])
+      manifest = rust(:asset_fetch, source, id, kind, resolution, file_format || "", downloads)
+      fetched = Json.parse(manifest) || raise("could not parse the download result")
+      problem = Json.text(fetched, "/error") || ""
+      raise problem unless problem == ""
+      first = run_module_timeout(host, port, setting(:blender_python), "import_asset", "{\"manifest\":#{manifest},\"target_size\":#{size},\"apply_to\":#{names}}", wait)
+      result = Json.parse(first) || raise("could not parse the import result")
+      fallback = Json.text(result, "/fallback") || ""
+      if fallback == ""
+        failure = Json.text(result, "/error") || ""
+        raise failure unless failure == ""
+        first
       else
-        download_polypizza(host, port, id, ts)
+        # A .blend written by a newer Blender cannot be opened here at all, and
+        # Poly Haven publishes a glTF of every model: a poorer record of the
+        # materials, but a model rather than none.
+        gltf = rust(:asset_fetch, source, id, kind, resolution, "gltf", downloads)
+        refetched = Json.parse(gltf) || raise("could not parse the download result")
+        refused = Json.text(refetched, "/error") || ""
+        raise "Model #{id} is #{fallback}, which this Blender cannot open, and the glTF fallback failed too: #{refused}" unless refused == ""
+        note = " Imported from glTF rather than .blend, because the .blend was #{fallback}; its materials are a conversion rather than the ones the artist built."
+        second = run_module_timeout(host, port, setting(:blender_python), "import_asset", "{\"manifest\":#{gltf},\"target_size\":#{size},\"apply_to\":[],\"note\":#{Json.quote(note)}}", wait)
+        again = Json.parse(second) || raise("could not parse the import result")
+        failed = Json.text(again, "/error") || ""
+        raise failed unless failed == ""
+        second
       end
-      parsed = Json.parse(imported)
-      problem = Json.text(parsed || raise("could not parse the download result"), "/error") || ""
-      if source == "polyhaven" && at == "textures" && problem == ""
-        names.each { |object_name| apply_texture_one(source, at, host, port, object_name, id) }
-        "#{imported}\n\nApplied the texture to the given objects."
-      else
-        imported
-      end
-    end
-  end
-
-  params :Generate3dParams do
-    field :prompt, :string, description: "What to make, in plain words; one object, for example \"a weathered wooden treasure chest\". Give prompt or image, not both", optional: true
-    field :image, :string, description: "An absolute image file path or an http(s) URL to model from, instead of a prompt; images attached in chat cannot be passed", optional: true
-    field :name, :string, description: "Name for the imported object; unset derives one from the prompt", optional: true
-    field :provider, :string, description: "Which generator to use; auto prefers Tripo, then Hunyuan3D, then Hyper3D Rodin, whichever is enabled", enum: ["auto", "hyper3d", "hunyuan3d", "tripo"], default: "auto"
-    field :quality, :string, description: "Tripo and Hunyuan3D only, Premium: standard or high; omit for the user's default", enum: ["standard", "high"], optional: true
-    field :bbox_condition, :i64_list, description: "Hyper3D Rodin only: [length, width, height] proportions, three positive integers", optional: true
-    field :job, :string, description: "A handle from an earlier call, to resume waiting for that generation instead of starting a new one", optional: true
-    field :wait_seconds, :i32, description: "How long to wait before returning a job handle; a single call is capped at 45 seconds and generation usually takes 1-3 minutes", default: 45, min: 5, max: 300
-  end
-
-  tool :generate_3d, params: :Generate3dParams, title: "Generate a 3D model",
-       description: "Make one new textured 3D model from a text prompt or an image, and import it into the scene. One object per call, never a whole scene, the ground or parts to assemble. It arrives at arbitrary scale and facing; the reply reports its world_bounding_box and how to place it. Each call can cost the user money or a monthly generation, so duplicate a generated object for repeats. Waits up to wait_seconds (a single call is capped at 45 s), then imports; if it is not done in time the reply names the provider and gives a job handle to resume with, so a client timeout never strands a paid generation.",
-       destructive: true, open_world: true do
-    body do |prompt, image, name, provider, quality, bbox_condition, job, wait_seconds|
-      host = setting(:blender_host)
-      port = Integer(setting(:blender_port), 10)
-      scripts = setting(:blender_scripts)
-      got = prompt || ""
-      img = image || ""
-      wanted = name || ""
-      q = quality || ""
-      bbox_list = bbox_condition || []
-      bbox_json = gen_bbox(bbox_list)
-      resume = job || ""
-      seconds = Integer(wait_seconds.to_s, 10)
-      gen_run(host, port, scripts, got, img, wanted, provider, q, bbox_json, resume, seconds)
-    end
-  end
-
-  params :Make3dParams do
-    field :prompt, :string, description: "What to make, in plain words; one object, for example \"a weathered wooden treasure chest\""
-    field :name, :string, description: "Name for the imported object; unset derives one from the prompt", optional: true
-    field :job, :string, description: "A handle from an earlier call, to resume waiting for that generation instead of starting a new one", optional: true
-  end
-
-  tool :make_3d, params: :Make3dParams, title: "Quick generate a 3D model",
-       description: "Make one new textured 3D model from a single text prompt and import it into the scene: the quick path, which chooses the provider automatically and waits the same 45 seconds. Reach for generate_3d instead when you need to choose a provider, supply an image, or set quality or bbox_condition, or to wait longer than 45 seconds. Like generate_3d it makes one object, never a whole scene, ground or parts to assemble, and each call can cost the user money or a monthly generation. The reply reports the imported object's world_bounding_box and how to place it, or a job handle to resume with.",
-       destructive: true, open_world: true do
-    body do |prompt, name, job|
-      host = setting(:blender_host)
-      port = Integer(setting(:blender_port), 10)
-      scripts = setting(:blender_scripts)
-      wanted = name || ""
-      resume = job || ""
-      gen_run(host, port, scripts, prompt, "", wanted, "auto", "", "null", resume, 45)
     end
   end
 
   transport :http, port: 8787, auth_setting: :mcp_token,
           allowed_hosts: ["host.docker.internal", "127.0.0.1", "localhost"]
 end
+
+
 

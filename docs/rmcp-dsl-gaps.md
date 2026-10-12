@@ -66,7 +66,7 @@ next_start = start + 20 < total ? start + 20 : nil   # unsupported NilNode
 *Workaround:* a sentinel such as `-1`, documented in the field description.
 **Suggest:** allow `nil` where a nil-able type is expected, so absent means absent.
 
-## 5. `ergonomics` — `+` will not mix `str` and `String`
+## 5. `ergonomics` — `+` will not mix `str` and `String` — **resolved**
 
 A Ruby literal lowers to borrowed `str`; a binding return is owned `String`, and
 Rust's `Add` allows `String + &str` but not `&str + String`. So
@@ -78,7 +78,7 @@ server ended up doing.
 **Suggest:** type string literals as `String` at `+`, accept a `Rust::Str(...)`
 cast, or add a hint ("use interpolation or `.to_s`").
 
-## 6. `ergonomics` — settings are always strings
+## 6. `ergonomics` — settings are always strings — **resolved**
 
 Numeric config must be parsed by hand: `Integer(setting(:blender_port), 10)`.
 *Workaround:* `Integer(setting(:x), 10)`.
@@ -100,7 +100,7 @@ binding, so the TCP client had to live in `json.rb` to reuse the type.
 *Workaround:* one binding module holds both.
 **Suggest:** document the one-module rule, or allow a shared/imported opaque type.
 
-## 9. `tooling` — bindings are resolved from disk and cached
+## 9. `tooling` — bindings are resolved from disk and cached — **resolved**
 
 `use_bindings` reads `bindings/*.rb` from disk. A binding saved *after* the
 server was first analysed is not picked up until the server's document changes,
@@ -146,7 +146,7 @@ Found while adding `look` (the LOOK script bridge), moving the transport into
 hand-written Rust, and adding the persistent connection and install-once. The
 entries below are ordered among themselves.
 
-## 12. `tooling` — the build reads disk, and a stale buffer hides that
+## 12. `tooling` — the build reads disk, and a stale buffer hides that — **resolved**
 
 Three separate round trips came from this in one session, so it leads.
 
@@ -201,7 +201,7 @@ checks, but it costs the typed layer:
 **Suggest:** allow `rust_file` at binding level (a binding's implementation in a
 `.rs` file beside it), and a nullable `returns:` such as `:string?`.
 
-## 15. `typing` — binding parameters cannot be nil-able, and list fields take no default
+## 15. `typing` — binding parameters cannot be nil-able, and list fields take no default — **resolved**
 
 ```ruby
 sig { params(items: T.nilable(T::Array[String])).returns(String) }
@@ -228,7 +228,7 @@ allow "a string, number or true/false literal"), so an optional list is
 - **Locals are checked against Rust keywords** (`local ref must be snake_case
   and not a Rust keyword`) — a good diagnostic, worth keeping.
 
-## 17. `ergonomics`/`codegen` — `||` moves its left operand
+## 17. `ergonomics`/`codegen` — `||` moves its left operand — **resolved**
 
 ```ruby
 raw = Json.parse(...)
@@ -243,7 +243,7 @@ local.
 **Suggest:** borrow at the `||` site, or add a hint naming the local the operator
 consumed.
 
-## 18. `language` — a heredoc is not accepted as a keyword-argument value
+## 18. `language` — a heredoc is not accepted as a keyword-argument value — **resolved**
 
 ```ruby
 server "blender", version: "0.1.0",
@@ -313,7 +313,7 @@ check), and/or a `bind:` address. The bearer token is already the authentication
 story; the host check is a browser-oriented defence and is the wrong default for
 a token-bearing service meant to be reached from elsewhere.
 
-### 21. `language` — a `String` local cannot be borrowed or cloned
+### 21. `language` — a `String` local cannot be borrowed or cloned — **resolved**
 
 Moving a `String` local in one branch and reading it in another is a Rust error:
 
@@ -447,7 +447,7 @@ adjacent lines, depending on the field.
 **Suggest:** when the left operand of `||` is not nilable, say it: "`names` is
 not nilable, so `||` gives `[]` no element type; drop the fallback".
 
-### 26. `ergonomics` — a body-shape error names the statement, not the cause
+### 26. `ergonomics` — a body-shape error names the statement, not the cause — **resolved**
 
 An edit inserted a `params ... do ... end` block one line early, so it landed
 inside an existing tool body and the body's own `end`s then closed the new tool:
@@ -505,86 +505,7 @@ that no `use_bindings` names, warn: "bindings/imagefile.rb exists and is not loa
 its crates are not declared". That is the same class of catch the `output:` omission
 already gets, and it would have turned a rustc archaeology session into a line at
 `check` time.
-$ cd ~/Desktop/projects/mcp_true_test && \
-> MCP_TOKEN=9953b8392fa40abdb6fbb05d16c011db RAJ_NOTIFY=raj-0b6990fc bash dev.sh
-21:24:33 lint    the Python parses (via uv run --quiet --no-project python)
-21:25:45 BUILD   failed — still serving the last good build:
-blender.rmcp.rb:408: warning: unnecessary parentheses around function argument (in helper `gen_wait`; generated src/main.rs:1504)
-warning: unnecessary parentheses around function argument
-    --> src/main.rs:1504:125
-     |
-1504 | ... mut __st = ck_add_i64((kind.chars().count() as i64), 1, "blender.rmcp.rb:41...
-     |                           ^                           ^
-     |
-help: remove these parentheses
-     |
-1504 -         let ident = ({ let __cs: Vec<char> = rest.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64((kind.chars().count() as i64), 1, "blender.rmcp.rb:412:18 in helper `gen_wait`")? as i64; let __ln = (rest.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
-1504 +         let ident = ({ let __cs: Vec<char> = rest.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64(kind.chars().count() as i64, 1, "blender.rmcp.rb:412:18 in helper `gen_wait`")? as i64; let __ln = (rest.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
-     |
 
-For more information about this error, try `rustc --explain E0425`.
-error: could not compile `blender` (bin "blender") due to 1 previous error; 3 warnings emittedLast login: Tue Oct  6 19:20:12 on ttys005
-exec bash -l && clear
-rajandavis@MacBookPro mcp_true_test % exec bash -l && clear
-
-The default interactive shell is now zsh.
-To update your account to use zsh, please run `chsh -s /bin/zsh`.
-For more details, please visit https://support.apple.com/kb/HT208050.
-rajandavis ~/Desktop/projects/mcp_true_test on main[!?]
-$ cargo test --manifest-path build/blender.rmcp/Cargo.toml,
-error: manifest path `build/blender.rmcp/Cargo.toml,` does not exist
-rajandavis ~/Desktop/projects/mcp_true_test on main[!?]
-$ cargo test --manifest-path build/blender.rmcp/Cargo.toml
-    Blocking waiting for file lock on build directory
-   Compiling blender v0.1.0 (/Users/rajandavis/Desktop/projects/mcp_true_test/build/blender.rmcp)
-error[E0425]: cannot find function `image_numbers` in module `textvision`
-    --> src/main.rs:1724:34
-     |
-1724 |         let report = textvision::image_numbers(&source);
-     |                                  ^^^^^^^^^^^^^ not found in `textvision`
-
-warning: unnecessary parentheses around function argument
-    --> src/main.rs:1444:584
-     |
-1444 | ... let __ln = ck_sub_i64((word.chars().count() as i64), 1, "blender.rmcp.rb:15...
-     |                           ^                           ^
-     |
-     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
-help: remove these parentheses
-     |
-1444 -     Ok(if word == "" { "Generated".to_string() } else { let initial = ({ let __cs: Vec<char> = word.chars().collect(); let __n = __cs.len() as i64; let mut __st = 0 as i64; let __ln = 1 as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string()).to_uppercase(); let tail = ({ let __cs: Vec<char> = word.chars().collect(); let __n = __cs.len() as i64; let mut __st = 1 as i64; let __ln = ck_sub_i64((word.chars().count() as i64), 1, "blender.rmcp.rb:159:22 in helper `gen_default_name`")? as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string()); format!("{}{}", initial, tail) })
-1444 +     Ok(if word == "" { "Generated".to_string() } else { let initial = ({ let __cs: Vec<char> = word.chars().collect(); let __n = __cs.len() as i64; let mut __st = 0 as i64; let __ln = 1 as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string()).to_uppercase(); let tail = ({ let __cs: Vec<char> = word.chars().collect(); let __n = __cs.len() as i64; let mut __st = 1 as i64; let __ln = ck_sub_i64(word.chars().count() as i64, 1, "blender.rmcp.rb:159:22 in helper `gen_default_name`")? as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string()); format!("{}{}", initial, tail) })
-     |
-
-warning: unnecessary parentheses around function argument
-    --> src/main.rs:1502:126
-     |
-1502 | ...ut __st = ck_add_i64((provider.chars().count() as i64), 1, "blender.rmcp.rb:...
-     |                         ^                               ^
-     |
-help: remove these parentheses
-     |
-1502 -         let rest = ({ let __cs: Vec<char> = handle.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64((provider.chars().count() as i64), 1, "blender.rmcp.rb:410:19 in helper `gen_wait`")? as i64; let __ln = (handle.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
-1502 +         let rest = ({ let __cs: Vec<char> = handle.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64(provider.chars().count() as i64, 1, "blender.rmcp.rb:410:19 in helper `gen_wait`")? as i64; let __ln = (handle.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
-     |
-
-warning: unnecessary parentheses around function argument
-    --> src/main.rs:1504:125
-     |
-1504 | ... mut __st = ck_add_i64((kind.chars().count() as i64), 1, "blender.rmcp.rb:41...
-     |                           ^                           ^
-     |
-help: remove these parentheses
-     |
-1504 -         let ident = ({ let __cs: Vec<char> = rest.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64((kind.chars().count() as i64), 1, "blender.rmcp.rb:412:18 in helper `gen_wait`")? as i64; let __ln = (rest.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
-1504 +         let ident = ({ let __cs: Vec<char> = rest.chars().collect(); let __n = __cs.len() as i64; let mut __st = ck_add_i64(kind.chars().count() as i64, 1, "blender.rmcp.rb:412:18 in helper `gen_wait`")? as i64; let __ln = (rest.chars().count() as i64) as i64; if __st < 0 { __st += __n; } if __st < 0 || __st > __n || __ln < 0 { None } else { let __en = __st.saturating_add(__ln).min(__n); Some(__cs[__st as usize..__en as usize].iter().collect::<String>()) } }).unwrap_or_else(|| "".to_string());
-     |
-
-For more information about this error, try `rustc --explain E0425`.
-warning: `blender` (bin "blender" test) generated 3 warnings
-error: could not compile `blender` (bin "blender" test) due to 1 previous error; 3 warnings emitted
-rajandavis ~/Desktop/projects/mcp_true_test on main[!?]
-$
 ### 28. `tooling` — the `rust_fn` name *is* the Rust function's name, and no reference says so — **resolved**
 
 ```ruby
@@ -604,7 +525,7 @@ message already says as much, which is why this cost one rename and no archaeolo
 
 **Suggest:** state the mapping where `rust_fn` is declared.
 
-### 29. `tooling` — the compiler knows its inputs and does not say what they are
+### 29. `tooling` — the compiler knows its inputs and does not say what they are — **resolved**
 
 A watcher has to know which files a build reads. Ours was hand-written —
 `blender.rmcp.rb`, `bindings/json.rb`, `blender_bridge.rs` — and wrong twice in one
@@ -623,7 +544,7 @@ file, every `use_bindings` file and every `rust_file`, resolves them (including 
 maintained by hand was wrong twice in a day, and both times the symptom pointed at
 the tests rather than at the missing build.
 
-### 30. `runtime` — `allowed_hosts:` replaces the loopback defaults, silently
+### 30. `runtime` — `allowed_hosts:` replaces the loopback defaults, silently — **resolved**
 
 Setting `allowed_hosts: ["host.docker.internal"]` on `transport :http` makes the
 server trust **only** that name: `127.0.0.1` and `localhost`, trusted by default,
@@ -640,3 +561,102 @@ client did not, and only probing each `Host` by hand showed why. Adding
 trusted), or, if the list is meant to replace them, say so in the reference and show
 the loopback names in every example. A keyword whose effect is "forget the safe
 defaults" should make the caller ask for that explicitly.
+
+### 31. `codegen` — a String moved into an `if` expression is not cloned — **resolved**
+
+A local `String` used as a branch value is moved into the result, and a later read
+of the same local then fails to compile:
+
+```ruby
+failure = if output == "" then problem else "#{problem}\n#{output}" end
+raise failure unless problem == ""
+```
+
+generates `let failure = if output == "" { problem } else { format!(...) };` and
+then `if !(problem == "")`, which rustc refuses with E0382 (borrow of moved value:
+`problem`). `rmcp_dsl check` accepted the body; only `cargo build` caught it, so the
+watcher kept serving the previous build. The DSL already clones elsewhere
+(`settings().write_roots.clone().clone()`), just not here.
+
+Worked around by interpolating, which builds a new string: `"#{problem}"`.
+
+**Suggest:** clone a non-Copy local when it is used as a branch value and read
+again later (a liveness check over the body, or clone every branch value whose
+local is not dead), or have `check` flag the pattern so it fails before cargo does.
+
+### 32. `structure` — one server, one file: no way to split params, helpers or tools out
+
+`blender.rmcp.rb` is over a thousand lines: settings, a dozen helpers, 25 `params`
+blocks and 25 tools in one `server` block. The DSL has no include. `use_bindings`
+loads binding modules and `rust_file` copies Rust in, but nothing loads DSL
+declarations from another file. So the generation helpers, the asset helpers and
+each tool family cannot live beside each other in their own files, a review
+cannot be scoped to one family, and two agents editing different tools still
+contend for one file.
+
+**Suggest:** a `use_dsl "tools/assets.rmcp.rb"` (or `include`) allowed inside
+`server` that splices that file's `params`, `output`, `helper`, `tool`,
+`setting` and `rust_fn` declarations into the same server. Resolve it relative to
+the including file, report diagnostics against the included file's own lines (in
+`check`, the LSP and `rmcp_dsl.map.json`), and refuse a name declared twice
+across files. Helpers would stay visible server-wide, so a tool file can call a
+shared helper defined in a `helpers.rmcp.rb`.
+
+### 33. `structure` — `rust_file` is the only file hook, and it only knows Rust
+
+The server also depends on files the DSL cannot see. `python/mcp_scripts.py`,
+`python/mcp_guard.py` and `python/safe_mode.py` are shipped to Blender at
+runtime: a setting or string literal holds the path, `Json.read_text` reads it
+per call, and `run_module` builds `getattr(mod, "entry")(json.loads(...))` as a
+string. So nothing checks at build time that an entry point exists, that its
+arguments match what the tool sends, or that the file is even there. A missing
+entry is a runtime `AttributeError` inside Blender. Meanwhile `rust_file` does
+exactly this for Rust: it copies the file and lets rustc check every
+`rust_fn` against it.
+
+**Suggest:** generalise `rust_file` into a file hook that names the file's
+language and what the server does with it, for example
+`source "python/mcp_scripts.py", language: :python, as: :scripts, ship: :runtime`
+next to `source "rust/blender_jail.rs", language: :rust, as: :blender_jail`
+(today's `rust_file`). For a non-Rust source the DSL would:
+- check at build time that each referenced entry exists (`python_fn :look, from: :scripts` checked against the file's `def`s);
+- embed or locate the file reliably rather than by a cwd-relative path;
+- type the call: a typed `python(:look, args)` in place of hand-built JSON strings, with the TypedDict in the file as the schema;
+- give the LSP the link, so go-to-definition from a tool lands in the Python.
+
+How the text reaches its runtime (shipped once per content hash over a bridge,
+as `run_module` does now) can stay a binding concern. What belongs in the DSL is
+knowing the file, its language and its entry points.
+
+### 34. `language` — the `Rust::` opt-ins stop at integers — **resolved**
+
+Resolved 2026-10-12: `Rust::Str` ships (`trim`, `strip`, `to_lowercase`, `to_uppercase`, `len`, `lines`,
+`split`, `contains`, `starts_with?`, `replace`, `to_s`; no `parse_i32`), documented in `body-language.md`.
+`blender.rmcp.rb` now uses `Rust::Str(stdout).trim.to_s`, and `rust/blender_gen.rs` is deleted; the
+rebuilt server compiles clean. The other wrappers were not built (recommended, and the owner replied
+"please continue", 2026-10-11):
+`Option`, `Result` and `Vec` repeat the nil-able types and lists, `Fs` stays in bindings, and the
+integer names stay `Rust::Int32`/`Rust::Int64`.
+
+By design a Ruby method keeps Ruby semantics: `.strip` compiles to an
+explicit-set trim, not Rust's `trim()`, and Rust behaviour is opted into with a
+`Rust::` wrapper. Only `Rust::Int32(x)` and `Rust::Int64(x)` exist.
+`Rust::Str(stdout).trim` is refused with
+`unknown Rust type Rust::Str (known: Rust::Int32, Rust::Int64)`, and
+`references/body-language.md` documents only the two integer forms, though its
+notification list names `N-STR-STRIP-RUST`. So the Blender server reaches
+Rust's `trim()` through a one-function `rust_file` (`rust/blender_gen.rs`,
+`trim_text`) that exists only to work around this.
+
+**Suggest:** implement the planned wrappers and document them in
+`body-language.md` next to the integer ones:
+- `Rust::Option`: `some`/`none`, `map`, `unwrap_or`, `is_some?`, `ok_or`
+- `Rust::Result`: `ok`/`err`, `map`, `map_err`, `unwrap_or`, `?`-style early return
+- `Rust::Vec`: `push`, `len`, `iter`/`map`/`filter`/`collect`, `join`, `sort`
+- `Rust::Str`: `trim`, `to_lowercase`, `to_uppercase`, `replace`, `split`, `lines`, `starts_with?`, `contains`, `parse_i32`
+- `Rust::Fs`: `read_to_string(path)`, `read_dir(path)`, `exists?(path)`
+- `Rust::I32`: wrapping/checked arithmetic, truncating `/` and `%`
+
+Settle the integer names too: the reference says `Rust::Int32`/`Rust::Int64`,
+the plan says `Rust::I32`. Until a wrapper ships, the compiler's "known:" list
+is the authority, and the reference should not name codes that have no form.

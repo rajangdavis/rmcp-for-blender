@@ -178,3 +178,147 @@ Gotchas worth knowing before trusting a fast path:
 Upstream's own guides — seven of them, in the vendored package — never mention
 numpy or `foreach_get`, so this is one place their skill material is thinner than
 the API deserves.
+
+## "Bridge unreachable" can mean busy, not down
+
+Found while building `docs/scene-craft.md`. An `execute_code` call that remeshed
+about 900 spheres and then rendered at 1200x1600 with 128 samples returned
+`Blender bridge unreachable; start the addon's server in Blender` three times in a
+row. The work had finished: `ping` answered seconds later, every object the call
+made was in the scene, and the output PNG's mtime was 2 s old. The bridge times out
+on the reply, not on the work, and Blender's single main thread can't answer while
+it renders.
+
+So after a long call, `ping` and then check what the call was supposed to produce
+(object names, a file's mtime) before doing anything else. Re-running a
+non-idempotent script doubles its objects. That was the `.001` duplicate of every
+accessory the other agent's scene picked up. Long jobs fare better split up: build
+in one call, render in another.
+
+## `matrix_parent_inverse = parent.matrix_world.inverted()` cancels the parent
+
+A figure's head, beard, guitar and trunks rendered 0.92 m too low, clumped between
+its knees and under the sand, while the body (parented differently) was right. The
+helper had parented with an explicit inverse of the parent's world matrix, which is
+what "keep transform" does. It was meant for objects already placed in world space,
+and it silently undoes the parent for objects built in the parent's local frame.
+When children are authored in local coordinates, set `child.parent = parent` and
+leave the inverse at identity. Check one child numerically
+(`child.matrix_world.translation`) before trusting the render.
+
+## Two agents can share one Blender if neither switches scenes
+
+Object names are global across scenes, so give every datablock a prefix. Create
+objects with `bpy.data.objects.new` and link them into your own scene's
+collection, never through context-dependent `bpy.ops`. Render with
+`bpy.ops.render.render(write_still=True, scene=NAME)`, which renders a scene that
+is not the window's active one. Then view the PNG with
+`look {"mode":"image","image":PATH}`, since `look mode camera` uses the window's
+scene. Helpers don't survive between `execute_code` calls; keep them in a text
+block and `exec(bpy.data.texts[NAME].as_string())` at the top of each call.
+
+## AgX bleaches bright saturated emission
+
+A yellow-to-pink emissive title face at strength 1.6 rendered as flat cream under
+AgX - Punchy with bloom. At 0.75 the gradient survived. AgX rolls very bright
+saturated values toward white by design. For a coloured glow, keep the coloured
+surface near or below 1 and put the halo on a separate layer (a neon rim, or
+bloom from a thin emissive outline).
+
+## A text object's `offset` fills the letter holes
+
+`offset` grows the glyph outline, so a fat outline layer behind a text object is
+one line. At offset 0.05 and 0.078 on Impact at size 0.60, the outlines closed
+every counter and merged neighbouring letters into blobs. Below about 6% of the
+text size (0.034 and 0.050 at size 0.86) it reads as an outline. Turn off
+`visible_shadow` on stacked text layers, or the back layers cast dark wedges onto
+the face.
+
+`offset` can also tear a glyph whose outline has overlapping contours: 板 in
+Lantinghei SC broke at offset 0.03, and every hanzi broke at 0.08. `bevel_depth`
+strokes each contour instead, so it thickens and rims without tearing (face
+`bevel_depth` 0.03, rim copy 0.085, both at offset 0). A rim copy must match the
+face in font, size, `space_line`, alignment and `scale`, or every glyph doubles.
+
+## A compositor Render Layers node renders the wrong scene
+
+A freshly created `CompositorNodeRLayers` defaults its `scene` to the window's
+active scene, not the scene that owns the node tree. Building a compositor for a
+scene that is not active — a `PY_*` scene alongside others — and rendering it by
+name therefore composites the wrong scene, and when that scene has no render
+layers the output is pure greyscale (R=G=B everywhere). Bisected with a
+controlled red-emission probe: compositor off, colour; compositor on, grey. The
+fix is explicit on every Render Layers node: `node.scene = sc;
+node.layer = sc.view_layers[0].name`. Any compositor work in a non-active scene
+must set this.
+
+## Animating and rendering a scene that is not the active one
+
+Three traps, all hit while animating a `PY_*` scene that sits beside others
+(2026-10-09):
+
+- A **driver expression using `frame`** resolves against the *active* scene's
+  frame, not the scene that owns the driver. Every frame of a non-active scene
+  then renders identically. Use fcurves keyed at the first and last frame
+  instead, or drive off the owning scene explicitly.
+- **`bpy.ops.render.render(scene=...)` does not evaluate that scene's
+  animation.** Rendering a non-active scene ignores its frame; set
+  `bpy.context.window.scene = sc` first so the scene is the one being
+  evaluated. This is the same class of surprise as the compositor Render Layers
+  node defaulting to the active scene.
+- The **Hue/Saturation node is neutral at `0.5`, not `0`.** A cycle written as
+  `frame/N` therefore starts 180 degrees from the base palette; `0.5 + frame/N`
+  gives a full +360 turn that closes the loop.
+
+
+
+## Moving an animated object does nothing at the next frame change
+
+A keyed `location` overwrites whatever you assign as soon as the frame is
+evaluated, so `o.location.x += dx` on a rig with location keys snaps back. Shift
+the keys instead: for the fcurve `location[0]`, add `dx` to each key's `co.y`,
+`handle_left.y` and `handle_right.y`, then call `fc.update()`. Children of the
+rig follow without help. Children whose own keys are in the parent's space (steam
+on a mug rig) must not be shifted as well.
+
+## `matrix_world` is stale until the view layer updates
+
+After changing `location`, `scale` or a parent, `o.matrix_world` (and so any
+world bounding box built from `o.bound_box`) still reports the old
+placement in the same script. Call `bpy.context.view_layer.update()` before
+measuring. Without it, a layout script verifies against the positions it just
+replaced and prints numbers that look like nothing moved.
+
+## A child does not inherit its sibling's scale
+
+Curves added to a head rig at the head mesh's local coordinates sat *inside* the
+head, invisible, because the head mesh has object scale 1.22 and the rig does
+not. Copy the target's `scale` and `location` onto the add-on, or parent it to
+the mesh itself rather than to the mesh's parent.
+
+## A pattern from face materials has jagged edges
+
+Assigning a second material to faces by position (black hair on a white head)
+makes the boundary follow the mesh's polygons, which reads as a stair-step on
+a low-poly sphere. Compute a mask from the **object-space** texture coordinate
+instead: normalise by the mesh half-extents, express the regions as
+inequalities, and turn each one into a ramp `clamp((v - edge) * 40, 0, 1)`. The
+edge is then smooth, any shape you can write as a formula (a `sin` term makes a
+scalloped edge), and it moves with the object. See `scene-craft-cartoon.md`
+section 4.
+
+## A key at the last frame duplicates the seam of a loop
+
+A loop rendered over frames 1..N whose closing key sits at N, equal to frame
+1, shows that pose twice in a row on playback. Key the closing value at N+1 and
+keep `frame_end` at N. A continuous rotation over the loop must use `LINEAR`
+interpolation, or Bezier eases it to a stop at the seam.
+
+## Blender loads face 0 of a font collection
+
+`bpy.data.fonts.load()` on a `.ttc` takes its first face only. On macOS that
+makes "Hiragino Sans GB.ttc" the thin W3, PingFang the HK Regular, and
+Lantinghei the SC Demibold, so a bold weight inside a collection is often out of
+reach. Read `font.name` after loading to see which face you got. Many CJK
+fonts live under `/System/Library/AssetsV2/com_apple_MobileAsset_Font7/`, not
+`/System/Library/Fonts`.

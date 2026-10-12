@@ -31,7 +31,22 @@ stop() {
   fi
   rm -f "$PIDFILE"
 }
+# Whatever still listens on the server's port when a build starts is a stale
+# server (an earlier run that outlived its dev.sh, or one started by hand): it
+# would keep answering while the new build dies on "address in use". Kill it
+# outright, and say which process it was.
+free_port() {
+  local owner pid
+  owner=$(port_owner)
+  [ -n "$owner" ] || return 0
+  for pid in $owner; do
+    echo "$(date +%T) kill    pid $pid ($(ps -o comm= -p "$pid" 2>/dev/null)) was holding port $(server_port): kill -9"
+    kill -9 "$pid" 2>/dev/null
+  done
+  sleep 0.3
+}
 start() {
+  free_port
   MCP_TOKEN="$TOKEN" "$BIN" >>"$SERVERLOG" 2>&1 &
   echo $! > "$PIDFILE"
 }
@@ -55,11 +70,10 @@ notify() {
   fi
 }
 
-# The Python module the tools run is read at call time, so editing it needs no
-# rebuild - but it should not wait for a Blender call to prove it parses. uv is
-# what this repo already uses for Python (the vendored addon carries a
-# .python-version and a uv venv), so try it first and fall back to whatever
-# python3 the machine has. Whichever wins is proved here, at startup, rather
+# The Python the tools run (and the add-on Blender loads) is read at call time,
+# so editing it needs no rebuild - but it should not wait for a Blender call to
+# prove it parses. Try uv first and fall back to whatever python3 the machine
+# has. Whichever wins is proved here, at startup, rather
 # than discovered at lint time; the check is ast.parse, so no bpy import and no
 # bytecode written into the tree.
 pick_python() {
@@ -72,7 +86,8 @@ pick_python() {
   return 1
 }
 PYRUN="$(pick_python || true)"
-pystamp() { cat python/mcp_scripts.py 2>/dev/null | shasum -a 256 | cut -c1-16; }
+PYFILES=(python/mcp_scripts.py python/mcp_guard.py python/safe_mode.py addon/mcp_bridge.py)
+pystamp() { cat "${PYFILES[@]}" 2>/dev/null | shasum -a 256 | cut -c1-16; }
 lint() {
   if [ -z "$PYRUN" ]; then
     echo "$(date +%T) lint    no uv and no python3 here, so the Python was not checked"
@@ -84,7 +99,7 @@ for path in sys.argv[1:]:
         ast.parse(open(path).read(), path)
     except SyntaxError as e:
         print("%s:%s: %s" % (path, e.lineno, e.msg))
-        sys.exit(1)' python/mcp_scripts.py >"$BUILDLOG" 2>&1; then
+        sys.exit(1)' "${PYFILES[@]}" >"$BUILDLOG" 2>&1; then
     echo "$(date +%T) lint    the Python parses (via $PYRUN)"
   else
     echo "$(date +%T) LINT    the Python does not parse:"
@@ -102,16 +117,53 @@ listening() {
   [ -n "$port" ] || return 0
   (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null
 }
+# The port answering is not proof either: an older server still holding it makes
+# a new one die on "address in use" while the port keeps answering. So the
+# process this script started must be alive and be the one listening. lsof names
+# the owner; without lsof only the first half is checked.
+port_owner() {
+  command -v lsof >/dev/null 2>&1 || return 0
+  lsof -nP -iTCP:"$(server_port)" -sTCP:LISTEN -t 2>/dev/null
+}
 wait_alive() {
-  local tries=0
+  local tries=0 pid owner problem
+  pid=$(cat "$PIDFILE" 2>/dev/null)
+  problem="the new build is not listening"
   while [ $tries -lt 10 ]; do
-    if listening; then return 0; fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      problem="the new build (pid $pid) exited"
+      break
+    fi
+    if listening; then
+      owner=$(port_owner)
+      if [ -z "$owner" ] || printf '%s\n' "$owner" | grep -qx "$pid"; then return 0; fi
+      problem="port $(server_port) is held by pid $(echo $owner), not this build's pid $pid, and kill -9 did not free it"
+      break
+    fi
     tries=$((tries + 1)); sleep 0.5
   done
-  notify "MCP server did not come up after the rebuild: $(tail -n 3 "$SERVERLOG" | tr "\n" " ")"
-  echo "$(date +%T) START   the new build is not listening - the log says:"
+  notify "MCP server did not come up after the rebuild: $problem"
+  echo "$(date +%T) START   $problem - the log says:"
   tail -n 12 "$SERVERLOG"
   return 1
+}
+
+# Which server is running, for the log line: the version declared in the DSL
+# (what MCP clients see in the handshake) and a hash of the sources it was built from.
+server_version() { grep -m1 '^server "blender", version:' blender.rmcp.rb | grep -oE 'version: "[^"]+"' | cut -d'"' -f2; }
+identity() { echo "pid $(cat "$PIDFILE"), blender $(server_version), sources $(stamp)"; }
+
+# "Still serving the last good build" has to be made true on the first pass:
+# nothing is running yet, so a check or build that fails at startup would
+# otherwise leave no server at all. Start the binary already on disk instead.
+serving() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+keep_serving() {
+  if ! serving && [ -x "$BIN" ]; then
+    start
+    if wait_alive; then
+      echo "$(date +%T) stale   started the last good build on disk (pid $(cat "$PIDFILE")); fix the error above to replace it"
+    fi
+  fi
 }
 
 lastpy=""
@@ -129,17 +181,19 @@ while true; do
       if rmcp_dsl build blender.rmcp.rb >>"$BUILDLOG" 2>&1; then
         stop; start
         if wait_alive; then
-          echo "$(date +%T) ok      rebuilt and restarted (pid $(cat "$PIDFILE"))"
+          echo "$(date +%T) ok      rebuilt and restarted ($(identity))"
         fi
       else
         notify "MCP build failed: $(tail -n 5 "$BUILDLOG" | tr "\n" " ")"
         echo "$(date +%T) BUILD   failed — still serving the last good build:"
         tail -n 15 "$BUILDLOG"
+        keep_serving
       fi
     else
       notify "MCP DSL check failed: $(tail -n 3 "$BUILDLOG" | tr "\n" " ")"
       echo "$(date +%T) CHECK   failed — still serving the last good build:"
       tail -n 10 "$BUILDLOG"
+      keep_serving
     fi
   fi
   sleep 1
