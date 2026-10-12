@@ -13,6 +13,7 @@ rmcp_dsl
 # import_asset downloads land here for the length of one import, then are deleted
 downloads/
 renders/
+ref/
 
 # third-party reference trees: nothing in them is read at runtime. Blender runs
 # addon/mcp_bridge.py, and the one upstream file the server uses is copied, with
