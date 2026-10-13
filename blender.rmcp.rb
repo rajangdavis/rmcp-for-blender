@@ -22,6 +22,12 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
   rust_fn :grid, args: [:string, :i32], returns: :string, from: :textvision
   rust_fn :ansi, args: [:string, :i32, :string, :string], returns: :string, from: :textvision
 
+  # A render beside the picture it is meant to match: both images cropped,
+  # scaled and masked alike, written as one PNG. Pixel work the DSL cannot
+  # express, unit-tested with cargo test, and no Blender session needed.
+  rust_file "rust/refcompare.rs", as: :refcompare
+  rust_fn :compare, args: [:string, :string, :string, :string, :i32, :string], returns: :string, from: :refcompare
+
   # The path jail: every file path a tool takes is resolved in Rust, symlinks
   # followed, and refused unless it sits under a file root. canonicalize is
   # filesystem work the DSL cannot express, and the check has to see the path
@@ -284,6 +290,28 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
       bytes = ImageFile.size(path)
       measured = if bytes.nil? then report else "#{report}\nfile #{bytes || 0} bytes" end
       result(:TextReport, report: measured)
+    end
+  end
+
+  params :CompareReferenceParams do
+    field :reference, :string, description: "Path to the picture being matched, under the file roots"
+    field :render, :string, description: "Path to the render to judge against it, under the file roots; render writes one"
+    field :mask, :string, description: "Regions to grey out of both images, such as parts not built yet: polygons as \"u v, u v, u v; u v, ...\" in fractions of the frame, origin top-left. Prefix a polygon with \"#rrggbb~tolerance:\" to grey out only the reference pixels of that colour inside it (tolerance per channel, 0-255, default 40), such as lettering over a background that should still show. Empty masks nothing", default: ""
+    field :region, :string, description: "Zoom both images on one part of the frame: \"u0 v0 u1 v1\" in fractions, origin top-left. Empty shows the whole frame", default: ""
+    field :size, :i32, description: "Longest side of each panel in pixels; smaller keeps long sessions cheap", default: 540, min: 128, max: 1000
+    field :file, :string, description: "Where to write the PNG, under the write roots; unset writes renders/compare.png", optional: true
+  end
+
+  tool :compare_reference, params: :CompareReferenceParams, title: "Compare a render with its reference",
+       description: "Put a render beside the picture it is meant to match, as one image: the reference on the left, the render on the right, a magenta bar between. mask greys out the same regions in both, so parts not built yet do not distract; region zooms both on the same part of the frame. Use it after each render while matching a reference, and judge by eye: averaged scores (SSIM, colour histograms) reward a flat grey wash over contrast and shape.",
+       open_world: true do
+    body do |reference, render, mask, region, size, file|
+      left = jail(reference, setting(:write_roots), setting(:read_roots), "read")
+      right = jail(render, setting(:write_roots), setting(:read_roots), "read")
+      out = jail(file || "renders/compare.png", setting(:write_roots), setting(:read_roots), "write")
+      caption = rust(:compare, left, right, mask, region, size, out)
+      raise caption if caption.start_with?("compare failed:")
+      [image(Json.take_file_base64(out) || raise("could not read the comparison image"), "image/png"), text(caption)]
     end
   end
 

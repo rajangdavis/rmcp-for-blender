@@ -22,7 +22,7 @@ mainly to make a failure visible instead of silent.
 
 | job | tools |
 |---|---|
-| see | `wireframe`, `mesh_report`, `image_report`, `image_report_rust`, `look`, `screenshot`, `reveal` |
+| see | `wireframe`, `mesh_report`, `image_report`, `image_report_rust`, `look`, `screenshot`, `reveal`, `compare_reference` |
 | make | `text`, `duplicate`, `array`, `modifier`, `boolean` (asset libraries and 3D generation are out until they are ported to this server) |
 | place and look like something | `place`, `aim`, `material`, `light` |
 | hand over | `render` (a still PNG), `render_animation` (a frame range to video or PNG sequence), `export` (glb/fbx) |
@@ -46,6 +46,28 @@ is worth keeping. `look` when the picture itself is the answer.
 - **Strips:** render several crops (loop frames, one per candidate font), stitch
   them with numpy into one JPEG, and look once.
 - Previews go under the repo's `renders/look/`; delete them when done.
+
+## Matching a reference picture
+
+When the brief is "make it look like this image" (a cover, a concept painting):
+
+1. **Lay it out from the reference.** One camera at the reference's aspect, facing
+   the scene. Place each element by its fraction of the frame: at depth `d` in
+   front of a 50 mm lens on a 36 mm sensor the frame is `0.72·d` wide, so a point
+   at (u, v) sits at x = (u−0.5)·W, z = (0.5−v)·W.
+2. **Mask what is not built yet.** Trace each missing element (a figure, a title)
+   as a polygon in frame fractions once, and pass the same `mask` to every
+   `compare_reference` call.
+3. **Loop:** `render` → `compare_reference` → fix the three largest differences
+   you can name ("lower-right glow missing", "rocks lit too bright") → repeat.
+   Use `region` to zoom both images on one area when the detail matters (debris,
+   a silhouette, a texture).
+4. **Judge by eye, not by a score.** SSIM, edge SSIM and colour histograms ranked
+   the render the owner judged worst as the best of twelve: averages reward a
+   flat grey wash over contrast and shape. Sample the reference's colours for
+   materials, but keep the view transform in mind (AgX shifts every value).
+5. **Ask the owner** before trusting a read of a busy area. A wrong read (a
+   "ridge" that is floating shards) costs a full round.
 
 ## Report signatures worth recognising
 
