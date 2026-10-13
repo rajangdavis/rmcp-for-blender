@@ -44,7 +44,15 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
   setting :read_roots, env: "BLENDER_READ_ROOTS", default: "", description: "extra directories tools and execute_code may read but not write, such as a texture library or the system fonts; a list like PATH. Empty by default"
   setting :code_policy, env: "BLENDER_CODE_POLICY", default: "guarded", description: "how execute_code runs: guarded (the default) checks the code with upstream's validator, then runs it with every file path held to the roots and no processes, network or native code; open runs it unchecked, as the user, with the whole filesystem in reach; off refuses it"
   setting :mcp_token, env: "MCP_TOKEN", secret: true, description: "bearer token every request to the HTTP transport must carry; required, so every run needs MCP_TOKEN set"
-  setting :blender_python, env: "BLENDER_PYTHON", default: "python/mcp_scripts.py", description: "path to the Python module the scene and output tools run: a real module, read here and installed into Blender once per content hash"
+
+  # The Python module the scene and output tools run: read from disk on each
+  # call and installed into Blender once per content hash (run_module below).
+  # Each entry's def and its *Args TypedDict are checked when this is built, and
+  # again on each read; BLENDER_PYTHON replaces the path.
+  file "python/mcp_scripts.py", as: :scripts, env: "BLENDER_PYTHON",
+       entries: %i[viewport_screenshot look scene_items scene_summary wireframe image_report reveal text place
+                   material remove duplicate array boolean aim light modifier render render_animation export
+                   mesh_report object_info import_asset]
 
   # One command over the bridge: send, check the addon's status, and return the
   # result as JSON text (helpers cannot carry an opaque Json::Value).
@@ -84,9 +92,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
   # call. compile() is handed the file's own path, so a traceback out of Blender
   # names a line in that file instead of a generated string. Each entry point
   # takes the tool's arguments as a dict and returns a dict whose "report" is the
-  # text.
-  helper :run_module, args: [:string, :i64, :string, :string, :string], returns: :string do |host, port, path, entry, arguments|
-    module_source = Json.read_text(path) || raise("#{path} not found: the Python module these tools run lives there")
+  # text. The caller hands over the module's text and its path.
+  helper :run_module, args: [:string, :i64, :string, :string, :string, :string], returns: :string do |host, port, module_source, path, entry, arguments|
     qargs = Json.quote(arguments)
     qentry = Json.quote(entry)
     qpath = Json.quote(path)
@@ -114,8 +121,7 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
   # the failure this exists to prevent, and it is threaded by hand because the
   # DSL has no default arguments, so a second helper is the only way to vary it
   # without touching every other run_module call site.
-  helper :run_module_timeout, args: [:string, :i64, :string, :string, :string, :i64], returns: :string do |host, port, path, entry, arguments, timeout|
-    module_source = Json.read_text(path) || raise("#{path} not found: the Python module these tools run lives there")
+  helper :run_module_timeout, args: [:string, :i64, :string, :string, :string, :string, :i64], returns: :string do |host, port, module_source, path, entry, arguments, timeout|
     qargs = Json.quote(arguments)
     qentry = Json.quote(entry)
     qpath = Json.quote(path)
@@ -138,12 +144,22 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
     retry_stdout.split("__MCP_RESULT__").last || raise("the script finished without a result")
   end
 
+  # run_module on python/mcp_scripts.py (the `file` above), with the arguments
+  # an entry_args call built and checked.
+  helper :run_scripts, args: [:string, :i64, :string, :string], returns: :string do |host, port, entry, arguments|
+    run_module(host, port, file_text(:scripts), file_path(:scripts), entry, arguments)
+  end
+
+  helper :run_scripts_timeout, args: [:string, :i64, :string, :string, :i64], returns: :string do |host, port, entry, arguments, timeout|
+    run_module_timeout(host, port, file_text(:scripts), file_path(:scripts), entry, arguments, timeout)
+  end
+
   # The plain viewport capture: viewport_screenshot in our own module draws the
   # open 3D viewport offscreen, as it is, with no setting changed. Returns the
   # PNG as base64.
-  helper :viewport_png, args: [:string, :i64, :string, :i32], returns: :string do |host, port, path, max_size|
+  helper :viewport_png, args: [:string, :i64, :i32], returns: :string do |host, port, max_size|
     shot = Json.temp_png("viewport")
-    value = Json.parse(run_module(host, port, path, "viewport_screenshot", "{\"max_size\":#{max_size},\"filepath\":#{Json.quote(shot)}}")) || raise("could not parse the screenshot result")
+    value = Json.parse(run_scripts(host, port, entry(:scripts, :viewport_screenshot), entry_args(:scripts, :viewport_screenshot, max_size: max_size, filepath: shot))) || raise("could not parse the screenshot result")
     problem = Json.text(value, "/error") || ""
     raise problem unless problem == ""
     Json.take_file_base64(shot) || raise("could not read the screenshot file")
@@ -154,8 +170,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
   # centre. The PNG it wrote is read separately. It changes shading and overlays
   # to take the picture (and restores them), which is why plain viewport mode
   # uses viewport_png instead.
-  helper :look_info, args: [:string, :i64, :string, :string], returns: :string do |host, port, path, look_args|
-    info = Json.parse(run_module(host, port, path, "look", look_args)) || raise("could not parse the look result")
+  helper :look_info, args: [:string, :i64, :string], returns: :string do |host, port, look_args|
+    info = Json.parse(run_scripts(host, port, entry(:scripts, :look), look_args)) || raise("could not parse the look result")
     problem = Json.text(info, "/error") || ""
     raise problem unless problem == ""
     Json.dump(info) || raise("could not encode the look result")
@@ -175,8 +191,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "List objects, materials and collections in the current Blender scene, optionally filtered by name",
        output: :Scene, read_only: true, open_world: true do
     body do |query, limit|
-      arguments = "{\"query\":#{Json.quote(query)},\"limit\":#{limit}}"
-      value = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "scene_items", arguments)) || raise("could not parse the scene items")
+      arguments = entry_args(:scripts, :scene_items, query: query, limit: limit)
+      value = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :scene_items), arguments)) || raise("could not parse the scene items")
       result(:Scene, items: value)
     end
   end
@@ -200,22 +216,20 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
       q = query || ""
       r = root || ""
       fields = if detail == "placement"
-        "[\"location\",\"size\",\"ground\",\"rotation\",\"scale\",\"parent\"]"
+        ["location", "size", "ground", "rotation", "scale", "parent"]
       elsif detail == "contents"
-        "[\"children\",\"hidden\",\"details\",\"materials\",\"modifiers\",\"animation\"]"
+        ["children", "hidden", "details", "materials", "modifiers", "animation"]
       elsif detail == "health"
-        "[\"topology\",\"weights\"]"
+        ["topology", "weights"]
       elsif detail == "settings"
-        "[\"settings\"]"
+        ["settings"]
       elsif detail == "all"
-        "[\"location\",\"rotation\",\"scale\",\"size\",\"ground\",\"parent\",\"details\",\"materials\",\"modifiers\",\"animation\",\"hidden\",\"children\",\"topology\",\"weights\",\"settings\"]"
+        ["location", "rotation", "scale", "size", "ground", "parent", "details", "materials", "modifiers", "animation", "hidden", "children", "topology", "weights", "settings"]
       else
-        "[\"location\",\"size\",\"children\",\"hidden\"]"
+        ["location", "size", "children", "hidden"]
       end
-      jq = Json.quote(q)
-      jr = Json.quote(r)
-      arguments = "{\"query\":#{jq},\"root\":#{jr},\"limit\":#{limit},\"fields\":#{fields}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "scene_summary", arguments)) || raise("could not parse the scene summary")
+      arguments = entry_args(:scripts, :scene_summary, query: q, root: r, limit: limit, fields: fields)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :scene_summary), arguments)) || raise("could not parse the scene summary")
       result(:SceneInfo, data: data)
     end
   end
@@ -235,8 +249,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Draw a mesh as text: front, side or top edge projections at true proportions, one character per cell. A cheap, readable alternative to a screenshot when judging shape or diagnosing floating or disjoint parts.",
        output: :TextReport, read_only: true, open_world: true do
     body do |name, views, width, height|
-      args = "{\"name\":#{Json.quote(name)},\"views\":#{Json.str_list_json(views || [])},\"width\":#{width},\"height\":#{height}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "wireframe", args)) || raise("could not parse the wireframe result")
+      args = entry_args(:scripts, :wireframe, name: name, views: views || [], width: width, height: height)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :wireframe), args)) || raise("could not parse the wireframe result")
       result(:TextReport, report: Json.text(data, "/report") || raise("the wireframe script returned no text"))
     end
   end
@@ -250,8 +264,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Describe an image to a reader that cannot see it: dimensions and aspect, the mean colour and the six most common colours, then two character grids over the same cells, one for tone (dark to bright) and one for hue (red/yellow/green/cyan/blue/magenta, grey or desaturated as a dot). Use it when an image content block cannot be read directly.",
        output: :TextReport, read_only: true, open_world: true do
     body do |source, width|
-      args = "{\"source\":#{Json.quote(image_ref(source, setting(:write_roots), setting(:read_roots)))},\"width\":#{width}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "image_report", args)) || raise("could not parse the image report")
+      args = entry_args(:scripts, :image_report, source: image_ref(source, setting(:write_roots), setting(:read_roots)), width: width)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :image_report), args)) || raise("could not parse the image report")
       result(:TextReport, report: Json.text(data, "/report") || raise("the image script returned no text"))
     end
   end
@@ -289,8 +303,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        output: :TextReport, read_only: true, open_world: true do
     body do |name, frame|
       wanted = name || ""
-      args = "{\"name\":#{Json.quote(wanted)},\"frame\":#{frame}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "reveal", args)) || raise("could not parse the reveal report")
+      args = entry_args(:scripts, :reveal, name: wanted, frame: frame)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :reveal), args)) || raise("could not parse the reveal report")
       result(:TextReport, report: Json.text(data, "/report") || raise("reveal returned no text"))
     end
   end
@@ -313,9 +327,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        output: :TextReport, destructive: true, open_world: true do
     body do |text, name, size, extrude, spacing, align, x, y, z, as_mesh|
       wanted = name || ""
-      spacing_json = if spacing.nil? then "null" else spacing.to_s end
-      args = "{\"text\":#{Json.quote(text)},\"name\":#{Json.quote(wanted)},\"size\":#{size},\"extrude\":#{extrude},\"spacing\":#{spacing_json},\"align\":#{Json.quote(align)},\"x\":#{x},\"y\":#{y},\"z\":#{z},\"as_mesh\":#{as_mesh}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "text", args)) || raise("could not parse the text report")
+      args = entry_args(:scripts, :text, text: text, name: wanted, size: size, extrude: extrude, spacing: spacing, align: align, x: x, y: y, z: z, as_mesh: as_mesh)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :text), args)) || raise("could not parse the text report")
       result(:TextReport, report: Json.text(data, "/report") || raise("the text script returned no text"))
     end
   end
@@ -336,15 +349,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Set an object's location, rotation or uniform scale: absolute by default, added to the current values when relative is set. Only the axes given are touched, so an unset axis keeps its value instead of being zeroed, which is what makes a relative nudge usable. The report gives what changed, the dimensions afterwards, whether a parent makes these numbers local, and any constraint that could override the result.",
        output: :TextReport, destructive: true, open_world: true do
     body do |name, x, y, z, rx, ry, rz, scale, relative|
-      qx = if x.nil? then "null" else x.to_s end
-      qy = if y.nil? then "null" else y.to_s end
-      qz = if z.nil? then "null" else z.to_s end
-      qrx = if rx.nil? then "null" else rx.to_s end
-      qry = if ry.nil? then "null" else ry.to_s end
-      qrz = if rz.nil? then "null" else rz.to_s end
-      qscale = if scale.nil? then "null" else scale.to_s end
-      args = "{\"name\":#{Json.quote(name)},\"x\":#{qx},\"y\":#{qy},\"z\":#{qz},\"rx\":#{qrx},\"ry\":#{qry},\"rz\":#{qrz},\"scale\":#{qscale},\"relative\":#{relative}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "place", args)) || raise("could not parse the placement report")
+      args = entry_args(:scripts, :place, name: name, x: x, y: y, z: z, rx: rx, ry: ry, rz: rz, scale: scale, relative: relative)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :place), args)) || raise("could not parse the placement report")
       result(:TextReport, report: Json.text(data, "/report") || raise("place returned no text"))
     end
   end
@@ -363,10 +369,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
     body do |name, colour, material, roughness, metallic|
       wanted_colour = colour || ""
       wanted_material = material || ""
-      qrough = if roughness.nil? then "null" else roughness.to_s end
-      qmetal = if metallic.nil? then "null" else metallic.to_s end
-      args = "{\"name\":#{Json.quote(name)},\"colour\":#{Json.quote(wanted_colour)},\"material\":#{Json.quote(wanted_material)},\"roughness\":#{qrough},\"metallic\":#{qmetal}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "material", args)) || raise("could not parse the material report")
+      args = entry_args(:scripts, :material, name: name, colour: wanted_colour, material: wanted_material, roughness: roughness, metallic: metallic)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :material), args)) || raise("could not parse the material report")
       result(:TextReport, report: Json.text(data, "/report") || raise("material returned no text"))
     end
   end
@@ -380,9 +384,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Delete named objects from the scene and report the cost: what went, which of their children were left unparented, what the orphan purge freed, and what is left. The counterpart of text and place. Blender's own undo may not cover it, so treat a removal as final.",
        output: :TextReport, destructive: true, open_world: true do
     body do |names, purge|
-      listed = Json.str_list_json(names)
-      args = "{\"names\":#{listed},\"purge\":#{purge}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "remove", args)) || raise("could not parse the removal report")
+      args = entry_args(:scripts, :remove, names: names, purge: purge)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :remove), args)) || raise("could not parse the removal report")
       result(:TextReport, report: Json.text(data, "/report") || raise("remove returned no text"))
     end
   end
@@ -402,9 +405,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Copy one or more objects, offsetting each copy by a fixed step, so one generated chair becomes a row. Full copies by default, each with its own mesh; linked copies share the original's data and change together. Copies land in the original's collections and keep its parent.",
        output: :TextReport, destructive: true, open_world: true do
     body do |names, count, dx, dy, dz, linked|
-      listed = Json.str_list_json(names)
-      args = "{\"names\":#{listed},\"count\":#{count},\"dx\":#{dx},\"dy\":#{dy},\"dz\":#{dz},\"linked\":#{linked}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "duplicate", args)) || raise("could not parse the copy report")
+      args = entry_args(:scripts, :duplicate, names: names, count: count, dx: dx, dy: dy, dz: dz, linked: linked)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :duplicate), args)) || raise("could not parse the copy report")
       result(:TextReport, report: Json.text(data, "/report") || raise("duplicate returned no text"))
     end
   end
@@ -422,11 +424,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Add or update an array modifier on one mesh, so it repeats along an axis without duplicating objects: the row follows the original, and renders and exports apply it. mesh_report and wireframe read the base mesh, so they still see a single copy.",
        output: :TextReport, destructive: true, open_world: true do
     body do |name, count, mode, offset_x, offset_y, offset_z|
-      qx = if offset_x.nil? then "null" else offset_x.to_s end
-      qy = if offset_y.nil? then "null" else offset_y.to_s end
-      qz = if offset_z.nil? then "null" else offset_z.to_s end
-      args = "{\"name\":#{Json.quote(name)},\"count\":#{count},\"mode\":#{Json.quote(mode)},\"offset_x\":#{qx},\"offset_y\":#{qy},\"offset_z\":#{qz}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "array", args)) || raise("could not parse the array report")
+      args = entry_args(:scripts, :array, name: name, count: count, mode: mode, offset_x: offset_x, offset_y: offset_y, offset_z: offset_z)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :array), args)) || raise("could not parse the array report")
       result(:TextReport, report: Json.text(data, "/report") || raise("array returned no text"))
     end
   end
@@ -443,8 +442,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Boolean one mesh against another and report the result's face count, so a cut that missed shows up now rather than at render time. Applied by default, which changes the mesh itself; with apply false it stays a live modifier. Both must be meshes, and a difference needs them to overlap.",
        output: :TextReport, destructive: true, open_world: true do
     body do |name, operand, operation, apply, hide_operand|
-      args = "{\"name\":#{Json.quote(name)},\"operand\":#{Json.quote(operand)},\"operation\":#{Json.quote(operation)},\"apply\":#{apply},\"hide_operand\":#{hide_operand}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "boolean", args)) || raise("could not parse the boolean report")
+      args = entry_args(:scripts, :boolean, name: name, operand: operand, operation: operation, apply: apply, hide_operand: hide_operand)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :boolean), args)) || raise("could not parse the boolean report")
       result(:TextReport, report: Json.text(data, "/report") || raise("boolean returned no text"))
     end
   end
@@ -462,10 +461,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        output: :TextReport, destructive: true, open_world: true do
     body do |target, camera, view, distance, lens|
       wanted_camera = camera || ""
-      qdistance = if distance.nil? then "null" else distance.to_s end
-      qlens = if lens.nil? then "null" else lens.to_s end
-      args = "{\"target\":#{Json.quote(target)},\"camera\":#{Json.quote(wanted_camera)},\"view\":#{Json.quote(view)},\"distance\":#{qdistance},\"lens\":#{qlens}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "aim", args)) || raise("could not parse the camera report")
+      args = entry_args(:scripts, :aim, target: target, camera: wanted_camera, view: view, distance: distance, lens: lens)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :aim), args)) || raise("could not parse the camera report")
       result(:TextReport, report: Json.text(data, "/report") || raise("aim returned no text"))
     end
   end
@@ -487,13 +484,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
     body do |name, kind, energy, size, target, x, y, z|
       wanted_name = name || ""
       wanted_target = target || ""
-      qenergy = if energy.nil? then "null" else energy.to_s end
-      qsize = if size.nil? then "null" else size.to_s end
-      qx = if x.nil? then "null" else x.to_s end
-      qy = if y.nil? then "null" else y.to_s end
-      qz = if z.nil? then "null" else z.to_s end
-      args = "{\"name\":#{Json.quote(wanted_name)},\"kind\":#{Json.quote(kind)},\"energy\":#{qenergy},\"size\":#{qsize},\"target\":#{Json.quote(wanted_target)},\"x\":#{qx},\"y\":#{qy},\"z\":#{qz}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "light", args)) || raise("could not parse the light report")
+      args = entry_args(:scripts, :light, name: wanted_name, kind: kind, energy: energy, size: size, target: wanted_target, x: x, y: y, z: z)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :light), args)) || raise("could not parse the light report")
       result(:TextReport, report: Json.text(data, "/report") || raise("light returned no text"))
     end
   end
@@ -514,10 +506,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
     body do |name, action, kind, count, amount, axis, apply|
       wanted_kind = kind || ""
       wanted_axis = axis || ""
-      qcount = if count.nil? then "null" else count.to_s end
-      qamount = if amount.nil? then "null" else amount.to_s end
-      args = "{\"name\":#{Json.quote(name)},\"action\":#{Json.quote(action)},\"kind\":#{Json.quote(wanted_kind)},\"count\":#{qcount},\"amount\":#{qamount},\"axis\":#{Json.quote(wanted_axis)},\"apply\":#{apply}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "modifier", args)) || raise("could not parse the modifier report")
+      args = entry_args(:scripts, :modifier, name: name, action: action, kind: wanted_kind, count: count, amount: amount, axis: wanted_axis, apply: apply)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :modifier), args)) || raise("could not parse the modifier report")
       result(:TextReport, report: Json.text(data, "/report") || raise("modifier returned no text"))
     end
   end
@@ -562,13 +552,9 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
       wanted_file = if file.nil? then "" else jail(file || "", roots, readable, "write") end
       folder = jail("renders", roots, readable, "write")
       wanted_camera = camera || ""
-      qwidth = if width.nil? then "null" else width.to_s end
-      qheight = if height.nil? then "null" else height.to_s end
-      qsamples = if samples.nil? then "null" else samples.to_s end
-      qframe = if frame.nil? then "null" else frame.to_s end
       wait = timeout_seconds || 900
-      args = "{\"file\":#{Json.quote(wanted_file)},\"folder\":#{Json.quote(folder)},\"camera\":#{Json.quote(wanted_camera)},\"width\":#{qwidth},\"height\":#{qheight},\"samples\":#{qsamples},\"frame\":#{qframe}}"
-      data = Json.parse(run_module_timeout(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "render", args, wait)) || raise("could not parse the render report")
+      args = entry_args(:scripts, :render, file: wanted_file, folder: folder, camera: wanted_camera, width: width, height: height, samples: samples, frame: frame)
+      data = Json.parse(run_scripts_timeout(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :render), args, wait)) || raise("could not parse the render report")
       result(:FileReport, path: Json.text(data, "/path") || "", report: Json.text(data, "/report") || raise("the render script returned no text"))
     end
   end
@@ -597,15 +583,9 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
       folder = jail("renders", roots, readable, "write")
       wanted_scene = scene || ""
       wanted_camera = camera || ""
-      qframe_start = if frame_start.nil? then "null" else frame_start.to_s end
-      qframe_end = if frame_end.nil? then "null" else frame_end.to_s end
-      qfps = if fps.nil? then "null" else fps.to_s end
-      qwidth = if width.nil? then "null" else width.to_s end
-      qheight = if height.nil? then "null" else height.to_s end
-      qsamples = if samples.nil? then "null" else samples.to_s end
       wait = timeout_seconds || 3600
-      args = "{\"file\":#{Json.quote(wanted_file)},\"folder\":#{Json.quote(folder)},\"scene\":#{Json.quote(wanted_scene)},\"camera\":#{Json.quote(wanted_camera)},\"frame_start\":#{qframe_start},\"frame_end\":#{qframe_end},\"fps\":#{qfps},\"width\":#{qwidth},\"height\":#{qheight},\"samples\":#{qsamples},\"format\":#{Json.quote(format)}}"
-      data = Json.parse(run_module_timeout(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "render_animation", args, wait)) || raise("could not parse the render_animation report")
+      args = entry_args(:scripts, :render_animation, file: wanted_file, folder: folder, scene: wanted_scene, camera: wanted_camera, frame_start: frame_start, frame_end: frame_end, fps: fps, width: width, height: height, samples: samples, format: format)
+      data = Json.parse(run_scripts_timeout(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :render_animation), args, wait)) || raise("could not parse the render_animation report")
       result(:FileReport, path: Json.text(data, "/path") || "", report: Json.text(data, "/report") || raise("the render_animation script returned no text"))
     end
   end
@@ -626,9 +606,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
       readable = setting(:read_roots)
       wanted_file = if file.nil? then "" else jail(file || "", roots, readable, "write") end
       folder = jail("exports", roots, readable, "write")
-      listed = Json.str_list_json(objects || [])
-      args = "{\"file\":#{Json.quote(wanted_file)},\"folder\":#{Json.quote(folder)},\"format\":#{Json.quote(format)},\"objects\":#{listed},\"selection_only\":#{selection_only},\"apply_modifiers\":#{apply_modifiers}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "export", args)) || raise("could not parse the export report")
+      args = entry_args(:scripts, :export, file: wanted_file, folder: folder, format: format, objects: objects || [], selection_only: selection_only, apply_modifiers: apply_modifiers)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :export), args)) || raise("could not parse the export report")
       result(:FileReport, path: Json.text(data, "/path") || "", report: Json.text(data, "/report") || raise("the export script returned no text"))
     end
   end
@@ -641,8 +620,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Measure a mesh: dimensions, world bounding box, faces and vertices, materials, modifiers, location and scale, the loose parts with their bounds, and a face-orientation histogram. Use it to check scale, placement and whether an assembly is actually joined.",
        output: :TextReport, read_only: true, open_world: true do
     body do |name|
-      args = "{\"name\":#{Json.quote(name)}}"
-      data = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "mesh_report", args)) || raise("could not parse the mesh report")
+      args = entry_args(:scripts, :mesh_report, name: name)
+      data = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :mesh_report), args)) || raise("could not parse the mesh report")
       result(:TextReport, report: Json.text(data, "/report") || raise("the mesh report script returned no text"))
     end
   end
@@ -673,11 +652,16 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
       else
         # Guarded: upstream's validator first, unmodified, then python/mcp_guard.py
         # runs the code with every path held to the roots (see its docstring).
-        verdict = Json.parse(run_module(host, port, "python/safe_mode.py", "is_safe", Json.quote(code))) || raise("could not parse the validator's verdict")
+        # Both are read by path, not declared as a `file`: upstream's is_safe
+        # takes the code as a bare string, which entry_args (always an object)
+        # cannot send, and mcp_guard.py has not been moved over yet.
+        validator = Json.read_text("python/safe_mode.py") || raise("python/safe_mode.py not found: the validator lives there")
+        verdict = Json.parse(run_module(host, port, validator, "python/safe_mode.py", "is_safe", Json.quote(code))) || raise("could not parse the validator's verdict")
         safe = Json.dump(Json.at(verdict, "/0") || raise("the validator returned no verdict")) || "false"
         raise "refused by the validator, #{Json.text(verdict, "/1") || "no reason given"}. Rewrite the script within the rules, or use a typed tool" unless safe == "true"
         arguments = "{\"code\":#{Json.quote(code)},\"write\":#{roots_json(setting(:write_roots))},\"read\":#{roots_json(setting(:read_roots))}}"
-        ran = Json.parse(run_module(host, port, "python/mcp_guard.py", "run", arguments)) || raise("could not parse the guard's result")
+        guard = Json.read_text("python/mcp_guard.py") || raise("python/mcp_guard.py not found: the guard lives there")
+        ran = Json.parse(run_module(host, port, guard, "python/mcp_guard.py", "run", arguments)) || raise("could not parse the guard's result")
         output = Json.text(ran, "/output") || ""
         problem = Json.text(ran, "/error") || ""
         # Interpolated, not assigned, so problem is not moved before the check
@@ -701,7 +685,7 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Return details for one scene object by name",
        output: :Object, read_only: true, open_world: true do
     body do |name|
-      value = Json.parse(run_module(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), "object_info", "{\"name\":#{Json.quote(name)}}")) || raise("could not parse the object info")
+      value = Json.parse(run_scripts(setting(:blender_host), Integer(setting(:blender_port), 10), entry(:scripts, :object_info), entry_args(:scripts, :object_info, name: name))) || raise("could not parse the object info")
       problem = Json.text(value, "/error") || ""
       raise problem unless problem == ""
       result(:Object, object: value)
@@ -716,7 +700,7 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
        description: "Capture the 3D viewport as a PNG image the model can look at. The visual feedback loop: look, then change",
        read_only: true, open_world: true do
     body do |max_size|
-      image(viewport_png(setting(:blender_host), Integer(setting(:blender_port), 10), setting(:blender_python), max_size), "image/png")
+      image(viewport_png(setting(:blender_host), Integer(setting(:blender_port), 10), max_size), "image/png")
     end
   end
 
@@ -742,16 +726,14 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
       s = shading || ""
       v = view || ""
       image_name = if image.nil? then "" else image_ref(image || "", setting(:write_roots), setting(:read_roots)) end
-      target_json = Json.str_list_json(targets || [])
-      views_json = Json.str_list_json(views || [])
-      frames_json = Json.i64_list_json(frames || [])
       host = setting(:blender_host)
       port = Integer(setting(:blender_port), 10)
       path = Json.temp_png("look")
-      arguments = "{\"mode\":#{Json.quote(mode)},\"shading\":#{Json.quote(s)},\"target\":#{target_json},\"views\":#{views_json},\"distance\":#{distance},\"view\":#{Json.quote(v)},\"frames\":#{frames_json},\"frame_count\":#{frame_count},\"max_size\":#{max_size},\"image\":#{Json.quote(image_name)},\"filepath\":#{Json.quote(path)}}"
+      arguments = entry_args(:scripts, :look, mode: mode, shading: s, target: targets || [], views: views || [], distance: distance, view: v,
+                             frames: frames || [], frame_count: frame_count, max_size: max_size, image: image_name, filepath: path)
       scripted = !(mode == "viewport" && s == "")
-      caption = if scripted then look_info(host, port, setting(:blender_python), arguments) else "Viewport capture." end
-      data = if scripted then (Json.take_file_base64(path) || raise("could not read the look image")) else viewport_png(host, port, setting(:blender_python), max_size) end
+      caption = if scripted then look_info(host, port, arguments) else "Viewport capture." end
+      data = if scripted then (Json.take_file_base64(path) || raise("could not read the look image")) else viewport_png(host, port, max_size) end
       [image(data, "image/png"), text(caption)]
     end
   end
@@ -809,12 +791,12 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
       wait = timeout_seconds || 900
       downloads = jail("downloads", setting(:write_roots), setting(:read_roots), "write")
       size = target_size || 0.0
-      names = Json.str_list_json(apply_to || [])
+      names = apply_to || []
       manifest = rust(:asset_fetch, source, id, kind, resolution, file_format || "", downloads)
       fetched = Json.parse(manifest) || raise("could not parse the download result")
       problem = Json.text(fetched, "/error") || ""
       raise problem unless problem == ""
-      first = run_module_timeout(host, port, setting(:blender_python), "import_asset", "{\"manifest\":#{manifest},\"target_size\":#{size},\"apply_to\":#{names}}", wait)
+      first = run_scripts_timeout(host, port, entry(:scripts, :import_asset), entry_args(:scripts, :import_asset, manifest: manifest, target_size: size, apply_to: names, note: ""), wait)
       result = Json.parse(first) || raise("could not parse the import result")
       fallback = Json.text(result, "/fallback") || ""
       if fallback == ""
@@ -830,7 +812,8 @@ server "blender", version: "0.2.0", instructions: "MCP for Blender drives the us
         refused = Json.text(refetched, "/error") || ""
         raise "Model #{id} is #{fallback}, which this Blender cannot open, and the glTF fallback failed too: #{refused}" unless refused == ""
         note = " Imported from glTF rather than .blend, because the .blend was #{fallback}; its materials are a conversion rather than the ones the artist built."
-        second = run_module_timeout(host, port, setting(:blender_python), "import_asset", "{\"manifest\":#{gltf},\"target_size\":#{size},\"apply_to\":[],\"note\":#{Json.quote(note)}}", wait)
+        # The fallback is only ever a model, which ignores apply_to (a texture setting).
+        second = run_scripts_timeout(host, port, entry(:scripts, :import_asset), entry_args(:scripts, :import_asset, manifest: gltf, target_size: size, apply_to: names, note: note), wait)
         again = Json.parse(second) || raise("could not parse the import result")
         failed = Json.text(again, "/error") || ""
         raise failed unless failed == ""

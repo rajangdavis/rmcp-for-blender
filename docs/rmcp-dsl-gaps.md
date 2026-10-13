@@ -44,7 +44,11 @@ cannot be filled from a binding at all.
 *Workaround:* return the array as `Json::Value`.
 **Suggest:** add `T::Array[Float]` (and `T::Array[I32]`, `T::Array[T::Boolean]`).
 
-## 3. `typing` — no typed record/row (rows themselves are expressible)
+## 3. `typing` — no typed record/row (rows themselves are expressible) — **resolved**
+
+Resolved 2026-10-12 in `rmcp_dsl`, inside the opaque-type rule: a binding's `class Row < RmcpDsl::Opaque` lists
+`field :text, String` lines after `type_rust`; bodies read `row.text`, `T::Array[Row]` and `list(Mod::Row)` work like
+lists of params objects, and the build checks the fields against the Rust struct (`docs/specs/typed_record.md`).
 
 Rows are reachable today: a binding can return `Json::Value`, e.g. a
 `Html.rows(html, ".place-card", ...)` yielding an array of objects, and
@@ -93,7 +97,10 @@ JSON in the body (typed maps exist, but not for a nested request object).
 **Suggest:** `to_json` on maps, or a map/JSON literal accepted where JSON is
 expected.
 
-## 8. `language`/`typing` — opaque types do not cross binding modules
+## 8. `language`/`typing` — opaque types do not cross binding modules — **resolved**
+
+Resolved 2026-10-11 by decision, not code (WAVE-PLAN D5): an opaque type stays owned by the module that declares it,
+so keep the type and the functions that use it in one binding; `rmcp_dsl/docs/bindings.md` says so.
 
 `Value` declared in `bindings/json.rb` cannot be passed to a function in another
 binding, so the TCP client had to live in `json.rb` to reuse the type.
@@ -215,7 +222,10 @@ allow "a string, number or true/false literal"), so an optional list is
 **Suggest:** allow nilable parameters (the callee can decide), or document the
 `optional: true` + `|| []` idiom beside the field table.
 
-## 16. `ergonomics` — small body/helper rules that cost a round trip each
+## 16. `ergonomics` — small body/helper rules that cost a round trip each — **resolved**
+
+Resolved 2026-10-11 (WAVE-PLAN D7): the rules are written down beside the helper section, "Helper rules" and "Moves"
+in `rmcp_dsl/docs/body-language.md`.
 
 - **Settings are body-only.** `setting(:x)` in a helper is refused ("settings
   are read in a tool, prompt or resource body, not in a helper or a binding"),
@@ -341,6 +351,9 @@ restructure rule beside gap #17, which is the same move semantics seen through
 
 ### 22. `codegen` — a cast operand is parenthesised, and rustc says so — **resolved**
 
+Re-verified 2026-10-12: a fresh `rmcp_dsl build blender.rmcp.rb` printed no `unused_parens` warning (the owner);
+`let_stmt` passes a cast through `unparen` since 2026-10-11 (WAVE-PLAN D5).
+
 `handle[provider.length + 1, …]` compiles to
 `ck_add_i64((provider.chars().count() as i64), 1, …)`, and rustc warns:
 
@@ -355,7 +368,11 @@ treat the fix as unconfirmed.
 
 **Suggest:** do not parenthesise a cast operand when emitting a call argument.
 
-### 23. `language` — no exception handling, so retries and fallbacks are written as values
+### 23. `language` — no exception handling, so retries and fallbacks are written as values — **resolved**
+
+Resolved 2026-10-11 by decision (WAVE-PLAN D-D2): "failures are values" is the documented pattern (the "Errors"
+bullet of `rmcp_dsl/docs/body-language.md`: no `begin`/`rescue`, a retry written as data); a `rescue` form can be
+added later without breaking it.
 
 Errors are `raise`d and cannot be caught: the body language has no `begin`/`rescue`
 and no `catch`. `.each { … }` loops cannot carry state between iterations either
@@ -584,7 +601,11 @@ Worked around by interpolating, which builds a new string: `"#{problem}"`.
 again later (a liveness check over the body, or clone every branch value whose
 local is not dead), or have `check` flag the pattern so it fails before cargo does.
 
-### 32. `structure` — one server, one file: no way to split params, helpers or tools out
+### 32. `structure` — one server, one file: no way to split params, helpers or tools out — **resolved**
+
+Resolved 2026-10-12 in `rmcp_dsl`: `use_dsl "dsl/x.rmcp.rb"` splices in a `fragment do ... end` file; errors and
+rustc messages name the fragment's own file and line, and the LSP checks a fragment through its root
+(`docs/specs/use_dsl.md`). `blender.rmcp.rb` is not split yet.
 
 `blender.rmcp.rb` is over a thousand lines: settings, a dozen helpers, 25 `params`
 blocks and 25 tools in one `server` block. The DSL has no include. `use_bindings`
@@ -602,7 +623,13 @@ the including file, report diagnostics against the included file's own lines (in
 across files. Helpers would stay visible server-wide, so a tool file can call a
 shared helper defined in a `helpers.rmcp.rb`.
 
-### 33. `structure` — `rust_file` is the only file hook, and it only knows Rust
+### 33. `structure` — `rust_file` is the only file hook, and it only knows Rust — **resolved**
+
+Resolved 2026-10-12: `file "python/mcp_scripts.py", as: :scripts, env: "BLENDER_PYTHON", entries: %i[...]` in
+`rmcp_dsl` (`docs/specs/source_hook.md`). Each entry's `def` and its TypedDict are checked at build, in the LSP and
+on each read; calls go through `entry`/`entry_args`, checked key by key (`Literal` fields against `enum:`).
+`blender.rmcp.rb` uses it for all 23 entries; verified live after a rebuild (`scene_info`, `reveal`, `place` both
+ways, `export` glb). `safe_mode.py` and `mcp_guard.py` are still read by path.
 
 The server also depends on files the DSL cannot see. `python/mcp_scripts.py`,
 `python/mcp_guard.py` and `python/safe_mode.py` are shipped to Blender at

@@ -11,7 +11,10 @@ and a traceback out of Blender names a line in this file.
 
 Every entry point's arguments and result are typed below (the *Args and result
 TypedDicts), matching what blender.rmcp.rb sends: an unset string arrives as "",
-an unset number as null. bpy and mathutils types resolve in a language server
+an unset number as null. The server builds each call's arguments with
+entry_args, which checks every key and type against the *Args class here when
+it is built, so every field is required and a change to one needs a rebuild of
+the server. bpy and mathutils types resolve in a language server
 once fake-bpy-module for the matching Blender version is installed where it
 runs; Blender itself never evaluates the annotations.
 
@@ -104,12 +107,12 @@ class ViewportShot(TypedDict):
 # --- Arguments, one per entry point ---
 
 
-class RevealArgs(TypedDict, total=False):
+class RevealArgs(TypedDict):
     name: str
     frame: bool
 
 
-class TextArgs(TypedDict, total=False):
+class TextArgs(TypedDict):
     text: str
     name: str
     size: float
@@ -125,7 +128,7 @@ class TextArgs(TypedDict, total=False):
 PlaceNumber = Literal["x", "y", "z", "rx", "ry", "rz", "scale"]
 
 
-class PlaceArgs(TypedDict, total=False):
+class PlaceArgs(TypedDict):
     name: str
     x: float | None
     y: float | None
@@ -137,7 +140,7 @@ class PlaceArgs(TypedDict, total=False):
     relative: bool
 
 
-class MaterialArgs(TypedDict, total=False):
+class MaterialArgs(TypedDict):
     name: str
     colour: str
     material: str
@@ -145,7 +148,7 @@ class MaterialArgs(TypedDict, total=False):
     metallic: float | None
 
 
-class RenderArgs(TypedDict, total=False):
+class RenderArgs(TypedDict):
     file: str  # resolved under the write roots by the server; "" for the default
     folder: str  # the default output folder, resolved the same way
     camera: str
@@ -155,7 +158,7 @@ class RenderArgs(TypedDict, total=False):
     frame: int | None
 
 
-class RenderAnimationArgs(TypedDict, total=False):
+class RenderAnimationArgs(TypedDict):
     file: str
     folder: str
     scene: str
@@ -169,7 +172,7 @@ class RenderAnimationArgs(TypedDict, total=False):
     format: Literal["mp4", "webm", "mkv", "png"]
 
 
-class ExportArgs(TypedDict, total=False):
+class ExportArgs(TypedDict):
     file: str
     folder: str
     format: Literal["glb", "fbx"]
@@ -178,12 +181,12 @@ class ExportArgs(TypedDict, total=False):
     apply_modifiers: bool
 
 
-class RemoveArgs(TypedDict, total=False):
+class RemoveArgs(TypedDict):
     names: list[str]
     purge: bool
 
 
-class DuplicateArgs(TypedDict, total=False):
+class DuplicateArgs(TypedDict):
     names: list[str]
     count: int
     dx: float
@@ -192,7 +195,7 @@ class DuplicateArgs(TypedDict, total=False):
     linked: bool
 
 
-class ArrayArgs(TypedDict, total=False):
+class ArrayArgs(TypedDict):
     name: str
     count: int
     mode: str
@@ -201,7 +204,7 @@ class ArrayArgs(TypedDict, total=False):
     offset_z: float | None
 
 
-class BooleanArgs(TypedDict, total=False):
+class BooleanArgs(TypedDict):
     name: str
     operand: str
     operation: str
@@ -209,7 +212,7 @@ class BooleanArgs(TypedDict, total=False):
     hide_operand: bool
 
 
-class AimArgs(TypedDict, total=False):
+class AimArgs(TypedDict):
     target: str
     camera: str
     view: str
@@ -217,7 +220,7 @@ class AimArgs(TypedDict, total=False):
     lens: float | None
 
 
-class LightArgs(TypedDict, total=False):
+class LightArgs(TypedDict):
     name: str
     kind: str
     energy: float | None
@@ -228,23 +231,23 @@ class LightArgs(TypedDict, total=False):
     z: float | None
 
 
-class WireframeArgs(TypedDict, total=False):
+class WireframeArgs(TypedDict):
     name: str
     views: list[str]
     width: int
     height: int
 
 
-class MeshReportArgs(TypedDict, total=False):
+class MeshReportArgs(TypedDict):
     name: str
 
 
-class ImageReportArgs(TypedDict, total=False):
+class ImageReportArgs(TypedDict):
     source: str  # an image's name in the file, or an absolute path the server resolved
     width: int
 
 
-class ModifierArgs(TypedDict, total=False):
+class ModifierArgs(TypedDict):
     name: str
     action: str
     kind: str
@@ -254,14 +257,14 @@ class ModifierArgs(TypedDict, total=False):
     apply: bool
 
 
-class SceneSummaryArgs(TypedDict, total=False):
+class SceneSummaryArgs(TypedDict):
     fields: list[str]
     limit: int
     query: str
     root: str
 
 
-class LookArgs(TypedDict, total=False):
+class LookArgs(TypedDict):
     mode: Literal["viewport", "camera", "angles", "frames", "image"]
     shading: str
     target: list[str]
@@ -279,16 +282,16 @@ class BoundsArgs(TypedDict, total=False):
     names: list[str]
 
 
-class SceneItemsArgs(TypedDict, total=False):
+class SceneItemsArgs(TypedDict):
     query: str
     limit: int
 
 
-class ObjectInfoArgs(TypedDict, total=False):
+class ObjectInfoArgs(TypedDict):
     name: str
 
 
-class ViewportArgs(TypedDict, total=False):
+class ViewportArgs(TypedDict):
     max_size: int
     filepath: str  # where to write the PNG, a server temp path
 
@@ -319,8 +322,8 @@ class AssetManifest(TypedDict, total=False):
     attribution: str | None
 
 
-class ImportAssetArgs(TypedDict, total=False):
-    manifest: AssetManifest
+class ImportAssetArgs(TypedDict):
+    manifest: str  # the AssetManifest asset_fetch wrote, as JSON text
     target_size: float  # metres across the largest dimension; 0 keeps the asset's own size
     apply_to: list[str]  # texture: objects to give a material built from it
     note: str  # appended to the message (the glTF fallback says why)
@@ -3033,9 +3036,11 @@ def import_asset(args: ImportAssetArgs) -> AssetImported | AssetFallback | Failu
     as a material (and on the apply_to objects), or a model scaled to
     target_size. Every new image is packed into the .blend, then the download
     folder is deleted, whatever happened."""
+    import json
+
     import bpy
 
-    manifest: AssetManifest = args.get("manifest") or {}
+    manifest = cast("AssetManifest", json.loads(args.get("manifest") or "{}"))
     kind = manifest.get("kind")
     images_before = set(bpy.data.images)
     try:
