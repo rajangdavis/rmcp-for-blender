@@ -2,7 +2,8 @@
 # mcp-for-blender (src/blender_mcp/safe_mode.py, MIT), so the server reads
 # nothing from vendor/. Guarded execute_code calls is_safe() here before
 # python/mcp_guard.py runs the code (see blender.rmcp.rb). Keep the body
-# byte-for-byte upstream's, so an upstream fix can be diffed in.
+# byte-for-byte upstream's, so an upstream fix can be diffed in; local policy
+# goes in the "Local policy" section at the end of the file.
 #
 # MIT License
 #
@@ -1014,3 +1015,204 @@ def is_safe(code: str) -> tuple[bool, str]:
     except SandboxViolation as exc:
         return False, str(exc)
     return True, ""
+
+
+# --- Local policy (not upstream) ---------------------------------------------
+# Everything above this line is upstream's body unmodified. Local additions go
+# below it, so a diff against upstream stays clean.
+#
+# Geometry Script (vendor/geometry-script-main, installed by the user as a
+# Blender add-on) builds Geometry Nodes trees from Python. Scripts may use it
+# only as `from geometry_script import Name, ...`. A plain `import
+# geometry_script` stays refused. The package has no __all__, so its namespace
+# re-exports every module its files import (os, sys, bpy, webbrowser, ...),
+# its own submodules, and helpers that touch files, register types, or open a
+# browser. Those names are refused below. The rest of the namespace is node
+# builders and socket types. This is a denylist, so a new import upstream in
+# Geometry Script means a new entry here.
+
+_GEOMETRY_SCRIPT: Final[str] = "geometry_script"
+
+_GEOMETRY_SCRIPT_DENIED: Final[frozenset[str]] = frozenset(
+    {
+        # modules its files import, re-exported through `import *`
+        "sys", "os", "bpy", "webbrowser", "inspect", "enum", "typing",
+        "itertools", "re", "nodeitems_utils", "node_arrange", "geometry_script",
+        # its own submodules
+        "api", "static", "preferences", "external", "absolute_path", "state",
+        "types", "node_mapper", "arrange", "attribute", "curve", "expression",
+        "input_group", "repeat", "sample_mode", "simulation",
+        # file access, registration, docs generation, and shared state
+        "load", "register", "unregister", "register_node", "build_node",
+        "create_documentation", "create_docs", "documentation",
+        "registered_nodes", "node_types_to_register", "denylist",
+        "class_denylist", "auto_resolve", "templates_menu_draw",
+        "editor_header_draw", "State", "NodeSocketStandard",
+        "GeometryScriptPreferences", "GeometryScriptSettings",
+        "GeometryScriptMenu", "OpenDocumentation",
+        "TEXT_MT_templates_geometryscript",
+    }
+)
+
+
+class _LocalValidator(_Validator):
+    """Upstream's validator plus the local Geometry Script rules: named
+    from-imports, and its `@tree("Name")` decorator."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        #: Names this script imported from geometry_script.
+        self.geometry_script_names: set[str] = set()
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.level or node.module != _GEOMETRY_SCRIPT:
+            if (node.module or "").split(".")[0] == _GEOMETRY_SCRIPT:
+                self._fail(
+                    f"import from {node.module!r} is not allowed; use "
+                    "`from geometry_script import Name`",
+                    node,
+                )
+            super().visit_ImportFrom(node)
+            return
+        for alias in node.names:
+            if alias.name == "*":
+                self._fail(
+                    "wildcard import hides what enters the namespace; name each "
+                    "geometry_script import",
+                    node,
+                )
+            if alias.name.startswith("_") or alias.name in _GEOMETRY_SCRIPT_DENIED:
+                self._fail(
+                    f"importing {alias.name!r} from geometry_script is not allowed",
+                    node,
+                )
+            if alias.asname:
+                self._fail("aliasing a geometry_script import is not allowed", node)
+            self._bind(alias.name, node)
+            self.geometry_script_names.add(alias.name)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # Geometry Script builds a node tree by decorating a function with
+        # `@tree("Name")`. Only that exact shape passes: `tree` imported from
+        # geometry_script, called with one string literal, as the only
+        # decorator. Every other decorator still reaches upstream's refusal.
+        decorators = node.decorator_list
+        if (
+            len(decorators) == 1
+            and isinstance(decorators[0], ast.Call)
+            and isinstance(decorators[0].func, ast.Name)
+            and decorators[0].func.id == "tree"
+            and "tree" in self.geometry_script_names
+            and len(decorators[0].args) == 1
+            and not decorators[0].keywords
+            and isinstance(decorators[0].args[0], ast.Constant)
+            and isinstance(decorators[0].args[0].value, str)
+        ):
+            node.decorator_list = []
+            try:
+                super().visit_FunctionDef(node)
+            finally:
+                node.decorator_list = decorators
+            return
+        super().visit_FunctionDef(node)
+
+
+# --- Asset library access (local policy) -------------------------------------
+# Upstream bans external .blend loading because a hostile file can carry code.
+# The owner would rather use their own asset libraries, so two call shapes are
+# reopened, for literal paths only: bpy.ops.wm.append, and
+# bpy.data.libraries.load in append mode (link=False). Aliasing these targets
+# stays caught by the attribute rules above. The directory scope is NOT decided
+# here: python/mcp_guard.py already holds every filepath/directory argument to
+# the server's roots at runtime (BLENDER_WRITE_ROOTS and BLENDER_READ_ROOTS),
+# so what these calls may read is exactly what is inside those roots — set
+# BLENDER_READ_ROOTS to add an asset library. Everything else about external
+# .blend files stays banned (wm.link, lib_relocate/lib_reload, computed paths).
+
+#: Allowed call -> its path keywords (the first positional argument of each is
+#: a path too, and must be a literal like every other argument).
+_ASSET_CALLS: Final[dict[tuple[str, ...], tuple[str, ...]]] = {
+    ("bpy", "data", "libraries", "load"): ("filepath",),
+    ("bpy", "ops", "wm", "append"): ("filepath", "directory"),
+}
+
+
+def _dotted_name(node: ast.expr) -> tuple[str, ...] | None:
+    """The dotted name an expression spells, or None when it is not a chain."""
+    parts: list[str] = []
+    cur: ast.expr = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return None
+    parts.append(cur.id)
+    parts.reverse()
+    return tuple(parts)
+
+
+class _AssetValidator(_LocalValidator):
+    """_LocalValidator plus the scoped asset-library allowance."""
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Attribute):
+            name = _dotted_name(node.func)
+            if name in _ASSET_CALLS:
+                self._check_asset_call(name, node)
+                # Check the module root normally (import and shadowing rules),
+                # then the arguments, and stop: descending into the attribute
+                # chain would hit the upstream ban this allowance relaxes.
+                root: ast.expr = node.func
+                while isinstance(root, ast.Attribute):
+                    root = root.value
+                self.visit(root)
+                for arg in node.args:
+                    self.visit(arg)
+                for kw in node.keywords:
+                    self.visit(kw.value)
+                return
+        super().visit_Call(node)
+
+    def _check_asset_call(self, name: tuple[str, ...], node: ast.Call) -> None:
+        dotted = ".".join(name)
+        paths = _ASSET_CALLS[name]
+
+        def literal_string(value: ast.expr) -> bool:
+            return (
+                isinstance(value, ast.Constant)
+                and isinstance(value.value, str)
+                and value.value != ""
+            )
+
+        for arg in node.args:
+            if isinstance(arg, ast.Starred):
+                self._fail(f"{dotted}: starred arguments cannot be checked", node)
+            if not isinstance(arg, ast.Constant):
+                self._fail(f"{dotted}: arguments must be literals", node)
+        if node.args and not literal_string(node.args[0]):
+            self._fail(f"{dotted}: the .blend path must be a literal string", node)
+        if name == ("bpy", "data", "libraries", "load") and len(node.args) >= 2:
+            if not (isinstance(node.args[1], ast.Constant) and node.args[1].value is False):
+                self._fail(
+                    f"{dotted}: pass link=False; linking keeps an external reference",
+                    node,
+                )
+        for kw in node.keywords:
+            if kw.arg is None:
+                self._fail(f"{dotted}: **kwargs hides which argument is a path", node)
+            if kw.arg in paths:
+                if not literal_string(kw.value):
+                    self._fail(f"{dotted}: the .blend path must be a literal string", node)
+            elif kw.arg == "link":
+                if not (isinstance(kw.value, ast.Constant) and kw.value.value is False):
+                    self._fail(
+                        f"{dotted}: pass link=False; linking keeps an external reference",
+                        node,
+                    )
+            elif not isinstance(kw.value, ast.Constant):
+                self._fail(f"{dotted}: arguments must be literals", node)
+
+
+# validate_code() looks _Validator up at call time, so this swaps the local
+# validator in without touching upstream's body.
+_Validator = _AssetValidator  # type: ignore[misc]

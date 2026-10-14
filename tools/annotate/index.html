@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Render Notes</title>
+<style>
+  :root { --bg: #15181c; --panel: #1e2328; --line: #343b44; --text: #e4e7ea; --dim: #8b949e; --mark: #ff4fd8; --sel: #ffd84f; --stale: #e3a33b; --ready: #4fdc7a; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.4 system-ui, sans-serif; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; gap: 16px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  header label { color: var(--dim); }
+  select, button, textarea { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 4px; font: inherit; }
+  button { padding: 4px 10px; cursor: pointer; }
+  .tools { display: inline-flex; gap: 2px; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+  .tools label { padding: 3px 10px; cursor: pointer; color: var(--dim); }
+  .tools input { display: none; }
+  .tools label:has(input:checked) { background: var(--panel); color: var(--text); }
+  #status { color: var(--dim); margin-left: auto; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #stage { flex: 1; display: flex; gap: 8px; padding: 8px; overflow: auto; align-items: flex-start; }
+  .panel { flex: 1; min-width: 0; }
+  .panel h2 { margin: 0 0 4px; font-size: 12px; font-weight: 500; color: var(--dim); }
+  .frame { position: relative; user-select: none; cursor: crosshair; }
+  .frame img { display: block; width: 100%; height: auto; }
+  .frame svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .shape { fill: none; stroke: var(--mark); stroke-width: 2.5; vector-effect: non-scaling-stroke; cursor: pointer; stroke-linecap: round; stroke-linejoin: round; }
+  .shape.sel { stroke: var(--sel); }
+  .shape.fixed { stroke-dasharray: 4 4; opacity: 0.5; }
+  .shape.ready { stroke: var(--ready); }
+  text { fill: var(--mark); font: bold 0.035px system-ui, sans-serif; paint-order: stroke; stroke: #000; stroke-width: 0.006px; pointer-events: none; }
+  text.sel { fill: var(--sel); }
+  aside { width: 340px; border-left: 1px solid var(--line); overflow: auto; padding: 8px; }
+  aside p.hint { color: var(--dim); margin: 4px 0 12px; }
+  .mark { border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin-bottom: 8px; background: var(--panel); }
+  .mark.sel { border-color: var(--sel); }
+  .mark .head { display: flex; gap: 8px; align-items: center; font-size: 12px; color: var(--dim); }
+  .mark .head b { color: var(--text); font-size: 14px; }
+  .mark .stale { color: var(--stale); }
+  .mark.ready { border-color: var(--ready); }
+  .thread { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+  .msg { font-size: 12px; padding: 5px 7px; border-radius: 4px; background: rgba(255, 255, 255, 0.04); border-left: 3px solid var(--line); white-space: pre-wrap; }
+  .msg .who { color: var(--dim); }
+  .msg.owner { border-left-color: var(--mark); }
+  .msg.ready { border-left-color: var(--ready); background: rgba(79, 220, 122, 0.12); }
+  .msg.sent_back { border-left-color: var(--stale); background: rgba(227, 163, 59, 0.12); }
+  .mark .row.replyrow button { margin-left: 0; }
+  .mark textarea { width: 100%; min-height: 56px; margin-top: 6px; resize: vertical; padding: 6px; }
+  .mark .row { display: flex; gap: 8px; align-items: center; margin-top: 4px; font-size: 12px; }
+  .mark .row button { margin-left: auto; padding: 2px 8px; }
+</style>
+</head>
+<body>
+<header>
+  <label>Render <select id="render"></select></label>
+  <label>Reference <select id="reference"></select></label>
+  <span class="tools" title="C circles, D draws">
+    <label><input type="radio" name="tool" value="circle" checked>circle</label>
+    <label><input type="radio" name="tool" value="draw">draw</label>
+  </span>
+  <label><input type="checkbox" id="showRef" checked> show reference</label>
+  <button id="copy">Copy notes for agent</button>
+  <span id="status"></span>
+</header>
+<main>
+  <div id="stage">
+    <div class="panel" id="refPanel"><h2>reference</h2><div class="frame" data-panel="reference"><img id="refImg" alt="reference"><svg viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div></div>
+    <div class="panel"><h2 id="renderTitle">render</h2><div class="frame" data-panel="render"><img id="renderImg" alt="render"><svg viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div></div>
+  </div>
+  <aside>
+    <p class="hint">Pick circle or draw (C / D keys), drag on either image to mark a spot, then type what is wrong there. Notes save on their own to renders/notes/&lt;render&gt;.json. Delete removes the selected mark. Each mark has a thread: the first message is the note, then reply under it (Ctrl/Cmd+Enter posts). Green marks are ones an agent says are ready to look at again: tick fixed, or reply and send them back.</p>
+    <div id="marks"></div>
+  </aside>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const NS = "http://www.w3.org/2000/svg";
+const round = (x) => Math.round(x * 1000) / 1000;
+let renders = [];          // [{name, mtime}] newest first
+let marks = [];            // [{n, panel, u0, v0, u1, v1, note, fixed, render_mtime}]
+let selected = null;       // mark number
+let saveTimer = null;
+const drafts = {};          // unsent reply text per mark number
+
+function renderMtime() {
+  const r = renders.find((f) => f.name === $("render").value);
+  return r ? r.mtime : 0;
+}
+
+function setStatus(text) { $("status").textContent = text; }
+
+const isReady = (m) => !m.fixed && m.review && m.review.state === "ready";
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+// Agents mark notes ready through /api/review; pick those up without touching
+// the owner's unsaved typing.
+async function refreshReviews() {
+  const image = $("render").value;
+  if (!image) return;
+  const data = await (await fetch("/api/notes?image=" + encodeURIComponent(image))).json();
+  if (image !== $("render").value) return;
+  const disk = new Map((data.marks || []).map((m) => [m.n, m]));
+  let changed = false;
+  for (const m of marks) {
+    const d = disk.get(m.n);
+    if (!d) continue;
+    for (const key of ["review", "thread"]) {
+      if (JSON.stringify(d[key] || null) !== JSON.stringify(m[key] || null)) { m[key] = d[key]; changed = true; }
+    }
+  }
+  if (changed) drawAll();
+}
+
+// The first post on a mark is its note; every later post goes to the thread.
+function post(m, text, state) {
+  if (!m.note && !state) {
+    if (!text) return;
+    m.note = text; drafts[m.n] = "";
+    drawAll(); save();
+    return;
+  }
+  if (text || state) postThread(m, text, state);
+}
+
+async function postThread(m, text, state) {
+  const body = { n: m.n, by: "owner", text };
+  if (state) body.state = state;
+  const res = await fetch("/api/thread?image=" + encodeURIComponent($("render").value), { method: "POST", body: JSON.stringify(body) });
+  const out = await res.json();
+  if (!res.ok) { setStatus("reply failed: " + out.error); return; }
+  m.review = out.review; m.thread = out.thread; drafts[m.n] = "";
+  drawAll();
+  setStatus(state === "sent_back" ? "sent #" + m.n + " back" : "replied on #" + m.n);
+}
+
+async function refreshList() {
+  const list = await (await fetch("/api/renders")).json();
+  const changed = JSON.stringify(list) !== JSON.stringify(renders);
+  if (!changed) return;
+  const prevRender = $("render").value, prevRef = $("reference").value, prevMtime = renderMtime();
+  renders = list;
+  for (const [sel, prev, fallback] of [[$("render"), prevRender, "hand3d_live.png"], [$("reference"), prevRef, "reference_1080.png"]]) {
+    sel.innerHTML = "";
+    for (const f of renders) sel.add(new Option(f.name, f.name));
+    const pick = [prev, fallback].find((n) => renders.some((f) => f.name === n));
+    if (pick) sel.value = pick;
+  }
+  if ($("render").value !== prevRender) await loadRender();
+  else if (renderMtime() !== prevMtime) { loadImages(); drawAll(); setStatus("render updated " + new Date().toLocaleTimeString()); }
+  if ($("reference").value !== prevRef) loadImages();
+}
+
+function loadImages() {
+  const r = renders.find((f) => f.name === $("render").value);
+  const ref = renders.find((f) => f.name === $("reference").value);
+  if (r) $("renderImg").src = "/renders/" + r.name + "?t=" + r.mtime;
+  if (ref) $("refImg").src = "/renders/" + ref.name + "?t=" + ref.mtime;
+  $("renderTitle").textContent = r ? "render: " + r.name + " (" + new Date(r.mtime * 1000).toLocaleTimeString() + ")" : "render";
+}
+
+async function loadRender() {
+  loadImages();
+  const data = await (await fetch("/api/notes?image=" + encodeURIComponent($("render").value))).json();
+  marks = data.marks || [];
+  if (data.reference && renders.some((f) => f.name === data.reference)) { $("reference").value = data.reference; loadImages(); }
+  selected = null;
+  drawAll();
+}
+
+function save() {
+  clearTimeout(saveTimer);
+  setStatus("saving...");
+  saveTimer = setTimeout(async () => {
+    const body = JSON.stringify({ reference: $("reference").value, marks });
+    const res = await fetch("/api/notes?image=" + encodeURIComponent($("render").value), { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    const out = await res.json();
+    setStatus(res.ok ? "saved " + out.saved : "save failed: " + out.error);
+  }, 400);
+}
+
+const tool = () => document.querySelector('input[name="tool"]:checked').value;
+
+// A circle is its bounding box; a drawn line also keeps its points.
+function shapeFor(m) {
+  if (m.kind === "path") {
+    const p = document.createElementNS(NS, "polyline");
+    p.setAttribute("points", m.points.map(([u, v]) => u + "," + v).join(" "));
+    p.classList.add("shape");
+    return p;
+  }
+  const e = document.createElementNS(NS, "ellipse");
+  e.setAttribute("cx", (m.u0 + m.u1) / 2); e.setAttribute("cy", (m.v0 + m.v1) / 2);
+  e.setAttribute("rx", Math.abs(m.u1 - m.u0) / 2); e.setAttribute("ry", Math.abs(m.v1 - m.v0) / 2);
+  e.classList.add("shape");
+  return e;
+}
+
+function drawAll() {
+  for (const frame of document.querySelectorAll(".frame")) {
+    const svg = frame.querySelector("svg");
+    svg.innerHTML = "";
+    for (const m of marks.filter((m) => m.panel === frame.dataset.panel)) {
+      const e = shapeFor(m);
+      e.classList.toggle("sel", m.n === selected); e.classList.toggle("fixed", !!m.fixed); e.classList.toggle("ready", isReady(m));
+      e.addEventListener("mousedown", (ev) => { ev.stopPropagation(); select(m.n); });
+      const t = document.createElementNS(NS, "text");
+      t.setAttribute("x", Math.min(m.u0, m.u1)); t.setAttribute("y", Math.min(m.v0, m.v1) - 0.005);
+      t.textContent = m.n; t.classList.toggle("sel", m.n === selected);
+      svg.append(e, t);
+    }
+  }
+  drawList();
+}
+
+function threadHtml(m) {
+  // Reviews posted before threads existed show as the thread's first message.
+  const r = m.review;
+  const list = (m.thread || []).length ? m.thread : r ? [{ by: r.by, text: r.note, state: r.state, at: r.at }] : [];
+  const all = m.note ? [{ by: "owner", text: m.note, state: null, at: null }, ...list] : list;
+  const items = all.map((e) => {
+    const when = e.at ? new Date(e.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+    const tag = e.state === "ready" ? " \u2014 ready for review" : e.state === "sent_back" ? " \u2014 sent back" : "";
+    const cls = ["msg", e.by === "owner" ? "owner" : "", e.state || ""].join(" ");
+    return `<div class="${cls}"><span class="who">${esc(e.by || "?")} ${esc(when)}${tag}</span>${e.text ? "\n" + esc(e.text) : ""}</div>`;
+  });
+  return items.length ? `<div class="thread">${items.join("")}</div>` : "";
+}
+
+function drawList() {
+  const box = $("marks");
+  const active = document.activeElement;
+  const focusN = active && active.tagName === "TEXTAREA" ? Number(active.closest(".mark").dataset.n) : null;
+  const focusRole = focusN !== null ? active.dataset.role : null;
+  const caret = focusN !== null ? [active.selectionStart, active.selectionEnd] : null;
+  box.innerHTML = "";
+  const now = renderMtime();
+  for (const m of marks) {
+    const div = document.createElement("div");
+    div.className = "mark" + (m.n === selected ? " sel" : "") + (isReady(m) ? " ready" : "");
+    const stale = m.panel === "render" && m.render_mtime && m.render_mtime < now ? '<span class="stale">made on an older render</span>' : "";
+    div.innerHTML = `<div class="head"><b>#${m.n}</b><span>${m.kind === "path" ? "line" : "circle"} on ${m.panel} u ${m.u0.toFixed(3)}-${m.u1.toFixed(3)}, v ${m.v0.toFixed(3)}-${m.v1.toFixed(3)}</span></div>
+      ${stale}${threadHtml(m)}
+      <textarea class="reply" data-role="reply" placeholder="${m.note ? "Reply in the thread..." : "What is wrong here, and what should it look like?"}"></textarea>
+      <div class="row replyrow"><button class="send">post</button>${isReady(m) ? '<button class="back">post + send back</button>' : ""}</div>
+      <div class="row"><label><input type="checkbox"> fixed</label><button class="del">delete</button></div>`;
+
+    const fx = div.querySelector("input");
+    fx.checked = !!m.fixed;
+    fx.addEventListener("change", () => { m.fixed = fx.checked; drawAll(); save(); });
+    div.querySelector("button.del").addEventListener("click", () => removeMark(m.n));
+    const rta = div.querySelector('textarea[data-role="reply"]');
+    rta.value = drafts[m.n] || "";
+    rta.addEventListener("input", () => { drafts[m.n] = rta.value; });
+    rta.addEventListener("focus", () => { if (selected !== m.n) { selected = m.n; highlight(); } });
+    rta.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); post(m, rta.value.trim(), null); } });
+    div.querySelector("button.send").addEventListener("click", () => post(m, rta.value.trim(), null));
+    const back = div.querySelector("button.back");
+    if (back) back.addEventListener("click", () => post(m, rta.value.trim(), "sent_back"));
+    div.dataset.n = m.n;
+    box.append(div);
+  }
+  if (focusN !== null) {
+    const ta = box.querySelector(`.mark[data-n="${focusN}"] textarea[data-role="${focusRole}"]`);
+    if (ta) { ta.focus(); ta.setSelectionRange(caret[0], caret[1]); }
+  }
+}
+
+// Selection changes without rebuilding the list, so a textarea keeps focus.
+function highlight() {
+  drawAll();
+  const ta = document.querySelector(`.mark[data-n="${selected}"] textarea[data-role="reply"]`);
+  if (ta) ta.focus();
+}
+
+function select(n) { selected = n; highlight(); }
+
+function removeMark(n) {
+  marks = marks.filter((m) => m.n !== n);
+  if (selected === n) selected = null;
+  drawAll(); save();
+}
+
+for (const frame of document.querySelectorAll(".frame")) {
+  frame.addEventListener("mousedown", (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    const box = frame.getBoundingClientRect();
+    const at = (e) => [Math.min(1, Math.max(0, (e.clientX - box.left) / box.width)), Math.min(1, Math.max(0, (e.clientY - box.top) / box.height))];
+    const [u0, v0] = at(ev);
+    const svg = frame.querySelector("svg");
+    const drawing = tool() === "draw";
+    const ghost = document.createElementNS(NS, drawing ? "polyline" : "ellipse");
+    ghost.classList.add("shape");
+    svg.append(ghost);
+    const points = [[round(u0), round(v0)]];
+    const move = (e) => {
+      const [u1, v1] = at(e);
+      if (drawing) {
+        const [pu, pv] = points[points.length - 1];
+        if (Math.hypot(u1 - pu, v1 - pv) < 0.004) return;
+        points.push([round(u1), round(v1)]);
+        ghost.setAttribute("points", points.map(([u, v]) => u + "," + v).join(" "));
+        return;
+      }
+      ghost.setAttribute("cx", (u0 + u1) / 2); ghost.setAttribute("cy", (v0 + v1) / 2);
+      ghost.setAttribute("rx", Math.abs(u1 - u0) / 2); ghost.setAttribute("ry", Math.abs(v1 - v0) / 2);
+    };
+    const up = (e) => {
+      window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
+      ghost.remove();
+      const [u1, v1] = at(e);
+      const us = drawing ? points.map((p) => p[0]) : [u0, u1];
+      const vs = drawing ? points.map((p) => p[1]) : [v0, v1];
+      const box = { u0: round(Math.min(...us)), v0: round(Math.min(...vs)), u1: round(Math.max(...us)), v1: round(Math.max(...vs)) };
+      if (box.u1 - box.u0 < 0.01 && box.v1 - box.v0 < 0.01) return;
+      const n = marks.reduce((a, m) => Math.max(a, m.n), 0) + 1;
+      const mark = { n, panel: frame.dataset.panel, ...box, note: "", fixed: false, render_mtime: renderMtime() };
+      if (drawing) { mark.kind = "path"; mark.points = points; }
+      marks.push(mark);
+      select(n); save();
+    };
+    window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+  });
+}
+
+document.addEventListener("keydown", (e) => {
+  if (document.activeElement.tagName !== "TEXTAREA" && (e.key === "c" || e.key === "d")) {
+    document.querySelector(`input[name="tool"][value="${e.key === "c" ? "circle" : "draw"}"]`).checked = true;
+  }
+  if ((e.key === "Delete" || e.key === "Backspace") && selected !== null && document.activeElement.tagName !== "TEXTAREA") removeMark(selected);
+});
+
+$("render").addEventListener("change", loadRender);
+$("reference").addEventListener("change", () => { loadImages(); save(); });
+$("showRef").addEventListener("change", () => { $("refPanel").style.display = $("showRef").checked ? "" : "none"; });
+$("copy").addEventListener("click", async () => {
+  const lines = marks.filter((m) => !m.fixed).map((m) => `#${m.n} ${m.kind === "path" ? "line" : "circle"} on ${m.panel}, frame u ${m.u0.toFixed(3)}-${m.u1.toFixed(3)} v ${m.v0.toFixed(3)}-${m.v1.toFixed(3)}: ${m.note || "(no note)"}${(m.thread || []).length ? " | latest: " + m.thread[m.thread.length - 1].by + ": " + m.thread[m.thread.length - 1].text : ""}${isReady(m) ? " [ready for review]" : ""}`);
+  const text = `Notes on renders/${$("render").value} (reference renders/${$("reference").value}; full file: renders/notes/${$("render").value}.json)\n` + lines.join("\n");
+  await navigator.clipboard.writeText(text);
+  setStatus("copied " + lines.length + " notes");
+});
+
+refreshList();
+setInterval(() => { refreshList(); refreshReviews(); }, 2000);
+</script>
+</body>
+</html>
